@@ -11,7 +11,7 @@ APP_NAME = "净影"
 # 唯一版本真源：窗口标题 / exe 版本资源 / CHANGELOG / zip 名 / git tag 全部
 # 从这里读。发版时只改这一行，再执行 `python build_release.py`；不要在其他
 # 地方手写版本号，否则又会出现「改了代码但版本号不变」。
-APP_VERSION = "1.6.3"
+APP_VERSION = "1.6.4"
 
 # 项目根目录（随脚本位置）
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -604,6 +604,11 @@ ALLOWED_HOST_SUFFIXES = [
     # https://v9-default.tt.x.bsgslb.cn/lf9-music-east.douyinstatic.com/obj/...?real_host=<base64>
     # 路径里带的是真实 douyinstatic 主机名，不放行会导致几乎所有背景音乐下载失败。
     "bsgslb.cn",
+    # 原始上传码流的 play 直链下载时还会再 302 到第三方 GSLB/CDN 节点：
+    # https://d6j3wcpdqlpqs.v1d.pkoplink.com/fsb9446b3f.a.bdydns.com/...
+    # 参数 http_x-tos-host=*.douyinvod.com 指明真实来源；不放行会让原片在
+    # 落盘前被 downloader._download_to_file 判为非法跳转并重取、最终回退转码档。
+    "pkoplink.com", "bdydns.com", "bdycdn.cn",
 ]
 
 

@@ -27,6 +27,7 @@ import atexit
 import json
 import logging
 import os
+import queue
 import random
 import re
 import threading
@@ -578,13 +579,81 @@ def get_session() -> OriginalSession:
         return _session
 
 
-def close_session() -> None:
+# ---------------------------------------------------------------- 会话专属线程
+# Playwright 的 sync API 把 greenlet 绑定在创建它的线程上。批量同步有 8 个下载
+# 线程，谁第一次建会话、其他线程复用就必然抛 "Cannot switch to a different
+# thread"，随后触发 2 分钟冷却，整轮同步静默回退最高转码档。这里把会话的创建、
+# 使用与关闭统一收敛到一条 daemon 线程，下载线程只提交任务并等结果。
+_session_jobs: "queue.Queue | None" = None
+_session_worker: "threading.Thread | None" = None
+_session_guard = threading.Lock()
+
+
+class _RemoteFailure:
+    """把会话线程里的异常原样带回调用线程。"""
+
+    def __init__(self, exc: BaseException):
+        self.exc = exc
+
+
+def _session_loop(jobs: queue.Queue) -> None:
+    while True:
+        job = jobs.get()
+        if job is None:
+            return
+        fn, args, kwargs, box = job
+        try:
+            box.put(fn(*args, **kwargs))
+        except BaseException as exc:  # noqa: BLE001 - 绝不让会话线程静默退出
+            box.put(_RemoteFailure(exc))
+
+
+def _submit_to_session(fn, *args, timeout: float = 180.0, **kwargs):
+    global _session_jobs, _session_worker
+    with _session_guard:
+        if _session_jobs is None:
+            _session_jobs = queue.Queue()
+            _session_worker = threading.Thread(
+                target=_session_loop, args=(_session_jobs,), daemon=True,
+                name="jy-original-session")
+            _session_worker.start()
+        jobs = _session_jobs
+    box: queue.Queue = queue.Queue(maxsize=1)
+    jobs.put((fn, args, kwargs, box))
+    try:
+        value = box.get(timeout=timeout)
+    except queue.Empty as exc:
+        raise OriginalStreamError("原画质回捞会话超时") from exc
+    if isinstance(value, _RemoteFailure):
+        raise value.exc
+    return value
+
+
+def _resolve_in_session(video_id: str, best_size: int, force: bool):
+    return get_session().resolve(video_id, best_size, force=force)
+
+
+def _close_in_session() -> None:
     global _session
     with _lock:
         session, _session = _session, None
         _cache.clear()
     if session is not None:
         session.close()
+
+
+def close_session() -> None:
+    """关窗/关开关时释放浏览器；close 必须在会话所在线程里执行。"""
+    with _session_guard:
+        jobs = _session_jobs
+    if jobs is None:
+        # CLI 等单线程场景：会话就在当前线程创建，直接关即可。
+        _close_in_session()
+        return
+    try:
+        _submit_to_session(_close_in_session, timeout=10.0)
+    except Exception:  # noqa: BLE001 - 关窗不能被浏览器卡住
+        logging.warning("原画质会话关闭失败", exc_info=True)
 
 
 def resolve_for_download(video_id: str, best_size: int = 0,
@@ -600,7 +669,7 @@ def resolve_for_download(video_id: str, best_size: int = 0,
     if time.monotonic() < _FAILURE_UNTIL:
         return None
     try:
-        return get_session().resolve(video_id, best_size, force=force)
+        return _submit_to_session(_resolve_in_session, video_id, best_size, force)
     except Exception as exc:  # noqa: BLE001 - 交给调用方记录并回退
         _FAILURE_UNTIL = time.monotonic() + FAILURE_COOLDOWN
         logging.warning("原画质回捞会话失败，冷却 %.0f 秒：%s",

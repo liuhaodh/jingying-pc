@@ -11,6 +11,8 @@ from PySide6.QtWidgets import (
 )
 
 MB = 1024.0 * 1024.0
+# 传输列表最多保留的行数：行数越多，insertItem(0) 重排所有 itemWidget 越慢。
+MAX_VISIBLE_ROWS = 60
 
 
 def format_rate(bytes_per_sec) -> str:
@@ -179,6 +181,9 @@ class TransferPanel(QFrame):
         self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.list.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.list.setWordWrap(False)
+        # 每行高度固定 36px：告诉 Qt 不必为每个 itemWidget 重算尺寸，长队列
+        # 同步时 insertItem 触发的全列表重排会便宜很多。
+        self.list.setUniformItemSizes(True)
         if compact:
             self.list.setMinimumHeight(114)
             self.list.setMaximumHeight(156)
@@ -193,8 +198,10 @@ class TransferPanel(QFrame):
             row["title"].setText(title)
             row["title"].setToolTip(title)
             return
-        # 长队列同步时不再无限 insert0/remove，避免几千个 started 信号把 UI 拖死。
-        if len(self._rows) >= 120:
+        # 长队列同步时不再无限 insert0/remove。行数越多，每次 insertItem(0)
+        # 要重排的 itemWidget 就越多；60 行足够看清单轮进度，也把主线程
+        # 的单次重排成本压下来（UI 看门狗曾在此处抓到 3~4s 卡顿）。
+        if len(self._rows) >= MAX_VISIBLE_ROWS:
             return
         widget = QWidget()
         box = QVBoxLayout(widget)
@@ -228,8 +235,6 @@ class TransferPanel(QFrame):
         item = QListWidgetItem()
         item.setData(Qt.ItemDataRole.UserRole, key)
         item.setSizeHint(QSize(0, 36))
-        self.list.insertItem(0, item)
-        self.list.setItemWidget(item, widget)
         self._rows[key] = {
             "item": item,
             "widget": widget,
@@ -239,11 +244,19 @@ class TransferPanel(QFrame):
             "bar": bar,
             "title_text": title,
         }
-        while self.list.count() > 120:
-            last = self.list.takeItem(self.list.count() - 1)
-            if last is not None:
-                old_key = last.data(Qt.ItemDataRole.UserRole)
-                self._rows.pop(old_key, None)
+        # 插入 + 绑定 widget + 裁剪溢出行放在一次「关闭重绘」区间里，避免
+        # 每个动作都触发一遍全列表布局/重绘。
+        self.list.setUpdatesEnabled(False)
+        try:
+            self.list.insertItem(0, item)
+            self.list.setItemWidget(item, widget)
+            while self.list.count() > MAX_VISIBLE_ROWS:
+                last = self.list.takeItem(self.list.count() - 1)
+                if last is not None:
+                    old_key = last.data(Qt.ItemDataRole.UserRole)
+                    self._rows.pop(old_key, None)
+        finally:
+            self.list.setUpdatesEnabled(True)
 
     def update_item(self, key, status):
         row = self._rows.get(key)

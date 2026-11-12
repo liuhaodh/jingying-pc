@@ -4,6 +4,30 @@
 窗口标题、exe 版本资源、便携目录 / zip 名、CHANGELOG 段落和 git tag 全部由它派生。
 版本规则遵循语义化版本：修复 bug 升 patch，功能/行为变更升 minor，破坏性变更升 major。
 
+## [v1.6.4] - 2026-11-13
+
+### 修复：批量同步时「原画质」开关实际不生效
+
+- **现象**：开启「优先下载原始上传码流」后跑「全部同步」，日志反复出现
+  `原画质回捞会话失败，冷却 120 秒：Cannot switch to a different thread`，
+  作品全部静默回退最高转码档。单条下载 / CLI 却正常——Playwright 的 sync API
+  把 greenlet 绑定在创建它的线程上，而批量同步有 8 个下载线程复用同一个
+  `OriginalSession`，跨线程调用必然失败。
+- **修复**：`original_stream` 新增一条专属 daemon 会话线程，会话的创建、探测与
+  关闭都在该线程内串行执行；下载线程只提交任务并等结果，异常原样带回并沿用
+  原有的 2 分钟失败冷却。CLI 单线程场景仍走原来的直接路径。
+- **修复**：原片直链下载时会二次 302 到第三方 GSLB/CDN 节点
+  （`*.v1d.pkoplink.com` / `*.bdydns.com` / `*.bdycdn.cn`，参数里仍带
+  `http_x-tos-host=*.douyinvod.com`），此前被 `ALLOWED_HOST_SUFFIXES` 拒绝后
+  重取直链、最终回退转码档。现按音乐 GSLB 的既有做法放行这三个后缀，无关域名
+  仍然拦截。
+- **界面**：传输列表声明统一行高（`setUniformItemSizes`）、插入/绑定/裁剪
+  合并进一次关闭重绘区间，可见行上限 120→60，压掉长队列同步时
+  `setItemWidget` 处 3~4 秒的 `UI stall`。
+- **回归**：新增 `tests/test_original_session_thread.py` 7 个用例（8 线程并发回捞
+  均落在同一会话线程、close 同线程、异常回传与冷却、端到端选中原片直链、
+  CDN 白名单正反例）；全量用例通过。
+
 ## [v1.6.3] - 2026-11-12
 
 ### 修复：通讯录同步时界面长时间无响应
