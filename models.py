@@ -30,6 +30,15 @@ class MediaInfo:
         self.ip_location = ""
         self.image_urls: list[str] = []
         self.image_videos: list[str] = []
+        # 「原画质」回捞（original_stream.py）：只有开关开启且确实拿到原片时才有值。
+        # video_id 是 video.play_addr.uri，规范里打 play 端点用的标识，不是 URL。
+        self.video_id = ""
+        self.best_gear_size = 0       # 最高转码档 data_size，算 factor 的分母
+        self.best_gear_name = ""
+        self.original_url = ""        # ratio=default 回捞到的 CDN 直链（有时效）
+        self.original_size = 0
+        self.original_verdict = ""    # original | transcoded | ""
+        self.ladder_quality = ""      # 阶梯择优原始标签，原片直链失效时回显
 
     def is_album(self):
         return bool(self.image_urls)
@@ -64,8 +73,11 @@ def _first_url(candidates) -> str:
                                 u = first.get(subkey)
                                 if isinstance(u, str) and u:
                                     return u
+            # play_addr.uri 是 video_id（形如 v0200fg…），不是可下载 URL。
+            # 以前无条件返回它会把「原片标识」当成直链，被域名白名单挡掉。
             uri = value.get("uri")
-            if isinstance(uri, str) and uri:
+            if isinstance(uri, str) and (uri.startswith(("http://", "https://", "/"))
+                                         or "." in uri):
                 return uri
         return ""
     if isinstance(candidates, list):
@@ -163,6 +175,33 @@ def parse_aweme(detail: dict) -> MediaInfo:
             _clean_url(_first_url(video.get("origin_cover"))) or \
             _clean_url(_first_url(video.get("dynamic_cover")))
         _select_video(video, info)
+        # 原画质回捞需要的两个字段，纯本地解析，不发任何请求。
+        # 批量同步时先只记下来，直链留到下载前一刻再取（CDN 链接有时效）。
+        addr = video.get("play_addr")
+        if isinstance(addr, dict):
+            info.video_id = str(addr.get("uri") or "")
+        gears = [g for g in (video.get("bit_rate") or []) if isinstance(g, dict)]
+        sized = []
+        for gear in gears:
+            gear_addr = gear.get("play_addr")
+            if not isinstance(gear_addr, dict):
+                continue
+            try:
+                size = int(gear_addr.get("data_size") or gear.get("data_size") or 0)
+            except (TypeError, ValueError):
+                size = 0
+            if size:
+                sized.append((size, str(gear.get("gear_name") or "")))
+        if not sized and isinstance(addr, dict):
+            try:
+                size = int(addr.get("data_size") or 0)
+            except (TypeError, ValueError):
+                size = 0
+            if size:
+                sized.append((size, "play_addr"))
+        if sized:
+            sized.sort(reverse=True)   # ★ 按 data_size 降序，不按分辨率/gear_name
+            info.best_gear_size, info.best_gear_name = sized[0]
 
     images = detail.get("images")
     if isinstance(images, list) and images:

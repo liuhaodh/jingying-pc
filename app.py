@@ -33,6 +33,7 @@ import download_log
 import downloader
 import parallel
 import links
+import original_stream
 import parser
 import store as store_mod
 import transfer
@@ -144,6 +145,12 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
         self._auto_upload_flag = bool(
             self._settings.get("webdav_auto_upload", True))
         self._upgrade_delete_paths = set()
+        # 「原画质」开关：回捞会额外发 play + HEAD 两个请求并加 1.2~3s 节流，
+        # 且原片体积可能是转码档的 20 倍，默认关闭。线程侧只认模块级 bool。
+        self._original_flag = bool(self._settings.get("original_quality", False))
+        original_stream.set_enabled(self._original_flag)
+        downloader.set_original_resolver(
+            original_stream.resolve_for_download if self._original_flag else None)
         self.dm = parallel.DownloadManager(
             self._dl_threads, pack_tar=bool(self._settings.get("pack_tar", False)),
             precheck=self._cloud_quality_precheck)
@@ -674,6 +681,23 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
         if getattr(self, "dm", None) is not None:
             self.dm.pack_tar = enabled
 
+    def _set_original_quality(self, checked):
+        """「优先下载原始上传码流」开关：写设置 + 线程侧快照 + 注册/注销回捞器。"""
+        enabled = bool(checked)
+        self._original_flag = enabled
+        self._settings["original_quality"] = enabled
+        self._save_settings()
+        original_stream.set_enabled(enabled)
+        downloader.set_original_resolver(
+            original_stream.resolve_for_download if enabled else None)
+        if not enabled:
+            # 关掉开关就把浏览器会话和直链缓存一起释放，不要留着后台进程
+            original_stream.close_session()
+        if getattr(self, "status", None) is not None:
+            self.status.setText(
+                "已开启原始码流优先：拿不到原片会自动回退最高转码档"
+                if enabled else "已关闭原始码流优先，按最高转码档下载")
+
     def _sync_thread_combos(self):
         for combo, value in ((self.transfer_dl_combo, self._dl_threads),
                              (self.transfer_up_combo, self._up_threads)):
@@ -1166,6 +1190,19 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
         pack_row.addWidget(self.pack_tar_hint)
         pack_row.addStretch(1)
         wl.addLayout(pack_row)
+        # 「原始上传码流」优先下载：默认关。仅用于本人作品或已获授权内容的归档。
+        # 规范里「原片」= 视频码流未经重编码，不等于上传文件的字节副本。
+        self.original_cb = QCheckBox("优先下载原始上传码流（原画质）")
+        self.original_cb.setChecked(
+            bool(self._settings.get("original_quality", False)))
+        self.original_cb.setToolTip(
+            "在当前已登录的浏览器会话里读取作品详情，用 play 端点回捞原始码流；\n"
+            "按「原片体积 / 最高转码档体积 ≥ 1.2」判定，拿不到就自动回退最高转码档。\n"
+            "需要已登录抖音；每个作品会多 2 次请求并节流 1.2~3 秒，原片可能大 20 倍。\n"
+            "仅用于本人作品或已获授权内容的归档与画质分析。")
+        self.original_cb.setStyleSheet("font-size:11px;color:#4b5563;")
+        self.original_cb.toggled.connect(self._set_original_quality)
+        wl.addWidget(self.original_cb)
         self.webdav_skip_cb = QCheckBox("跳过已上传（只传新增或变化的文件）")
         self.webdav_skip_cb.setChecked(True)
         self.webdav_skip_cb.setStyleSheet("font-size:11px;color:#4b5563;")
@@ -2285,6 +2322,11 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
                     pass
         try:
             self.dm.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        # 原画质回捞用的独立 Chromium 会话，关窗时释放（atexit 还有一层兜底）
+        try:
+            original_stream.close_session()
         except Exception:  # noqa: BLE001
             pass
         # 远端画质探测用的连接池：关窗时一并释放，并把缓存落盘

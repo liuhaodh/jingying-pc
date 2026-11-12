@@ -4,6 +4,55 @@
 窗口标题、exe 版本资源、便携目录 / zip 名、CHANGELOG 段落和 git tag 全部由它派生。
 版本规则遵循语义化版本：修复 bug 升 patch，功能/行为变更升 minor，破坏性变更升 major。
 
+## [v1.6.0] - 2026-11-12
+
+### 原始上传码流（原画质）回捞
+
+按《抖音「原画质」获取实现规范》(2026-11) 补齐第二条画质链路。此前程序里说的
+「原画」是 `bit_rate` 阶梯里分辨率最高的**转码成品**；`playwm→play` 只是换 CDN
+路径，编码没有任何变化。本版目标是「视频码流未经重编码」的原始上传码流——
+**不是上传时那个文件的字节副本**，容器与元数据仍被平台用 FFmpeg 重封装过。
+仅用于本人作品或已获授权内容的归档与画质分析。
+
+- **新增开关**：「优先下载原始上传码流（原画质）」，默认关闭。需要已登录抖音。
+- **不实现签名**：`detail` 由真实作品页的 JS 代发（复用 `resolver.js` 的
+  `__JY_STATE__.detail`），play 端点在已登录的浏览器上下文内发出，Cookie 天然正确。
+- **回捞链路**：`video.play_addr.uri` 作 `video_id` →
+  `GET /aweme/v1/play/?ratio=default&improve_bitrate=1&watermark=0&line=0`
+  （`max_redirects=0` 只读 `Location`，缺失时页面内 `fetch` 回退并立刻取消响应体）
+  → `HEAD` 取 `Content-Length` / `Content-Type` → 按 `play_addr.data_size` **降序**
+  取最高转码档做分母 → `factor >= 1.2` 判 `original`，否则 `transcoded`
+  并回退最高转码档。规范实测基线：24.2x / 0.43x / 3.72x。
+- **CDN 的 HEAD 不一定可用**：实测腾讯 COS 节点对 `HEAD` 返回 404
+  `application/xml`，但 `Range: bytes=0-1023` 的 GET 回 206 `video/mp4`。
+  现在 HEAD 失败时降级成只读 1 KB 的 Range GET，从 `Content-Range`
+  读总长度（不能把 `Content-Length: 1024` 当文件体积）；HEAD 正常但类型不符
+  时仍直接判定为降级流，不多发请求。真实样本 40.2 MB / 59.9 MB = 0.67x，
+  正确输出 `transcoded` 而不是误判或报错。
+- **直链时效性**：单条解析阶段回捞并放入 120 秒缓存；批量同步「先解析全部作者、
+  再统一下载」会隔很久，因此下载前由 `OriginalSession`（独立 Chromium profile +
+  已保存 Cookie + 首页预热）按 `video_id` 即时重取。直链下载失败会清缓存重取一次，
+  仍失败则回退最高转码档。会话级失败（未登录 / 浏览器起不来）冷却 2 分钟，
+  批量同步上千作品时不会每个都去重启一次 Chromium。
+- **软失效断言**（规范第 7 节，4 条）：`aweme_id` 非空；`desc` 与 `author` 不同时
+  为空；`play_addr.uri` 与 `bit_rate` 存在；CDN `Content-Length > 100 KB` 且
+  `Content-Type: video/*`。命中人机校验 / 未登录时明确报错；每次请求加 1.2~3.0 s
+  随机节流。任何回捞失败只记日志，**不会让作品下载失败**。
+- **落盘校验**：`inspect_mp4()` 不依赖 ffprobe，读 `ftyp` 品牌、遍历**所有**
+  `trak` 找 `stsd` 编码 tag、宽高、`mvhd` 时长（v0/v1）、平均码率；元数据扫描
+  限定在 `moov` 范围内（扫全文件会被 `mdat` 随机字节污染）。`Lavf` 两边都有，
+  单独不作为判据。
+- **其他改动**：原片下载 1 MB 分块（普通档仍 256 KB）；`_first_url` 不再把
+  `play_addr.uri`（video_id）当成可下载直链；`MediaInfo` 增加 `video_id` /
+  `best_gear_size` / `original_url` / `original_size` / `original_verdict` /
+  `ladder_quality`，结果卡片与下载日志显示「原始码流 xxMB · Nx」。
+- **命令行**（`tools/original_cli.py`）：`login-status` / `probe` / `download` /
+  `check` / `regress`。`regress` 用规范三个实测样本做离线巡检，失败返回非零
+  退出码，可直接挂每日定时任务。
+- **测试**：新增 `tests/test_original_stream.py`（43 个用例，含合成 MP4 结构检查、
+  三个实测样本、四条断言、`Location` 回退、HEAD 404 → Range GET、直链过期重取），
+  GUI 冒烟补 2 个开关用例。真实链路用项目自检样本做过只读探测（不下载内容）。
+
 ## [v1.5.0] - 2026-11-12
 
 ### 云端低画质自动重下

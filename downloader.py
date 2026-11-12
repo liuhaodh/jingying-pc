@@ -37,6 +37,48 @@ class DownloadCancelled(Exception):
 
 _thread_local = threading.local()
 
+# 「原画质」回捞回调，由主窗口在开关打开时注入（downloader 不反向依赖
+# original_stream / Playwright）。签名：
+#   resolver(video_id, best_gear_size, force=False) -> OriginalStream | None
+# 拿不到原片时返回 None，这里自动回退 info.play_url（最高转码档）。
+_ORIGINAL_RESOLVER = None
+
+
+def set_original_resolver(resolver):
+    global _ORIGINAL_RESOLVER
+    _ORIGINAL_RESOLVER = resolver
+
+
+def _video_stream_url(info, force=False):
+    """选本次真正要下载的视频直链，返回 (url, 是否原片)。
+
+    批量同步是「先解析全部作者、再统一下载」，解析阶段的 CDN 直链到下载时
+    早就过期了。所以这里按 video_id 即时回捞一次（解析阶段的结果有 120 秒
+    短缓存，单条下载不会重复发请求）。
+    """
+    vid = getattr(info, "video_id", "")
+    if _ORIGINAL_RESOLVER is not None and vid:
+        try:
+            stream = _ORIGINAL_RESOLVER(
+                vid, getattr(info, "best_gear_size", 0), force=force)
+        except Exception as exc:  # noqa: BLE001 - 回捞失败绝不能让作品下载失败
+            logging.warning("原画质回捞失败，回退最高转码档：%s", exc)
+            stream = None
+        if stream is not None and getattr(stream, "is_original", False) and stream.url:
+            info.ladder_quality = info.ladder_quality or info.quality
+            info.original_url = stream.url
+            info.original_size = getattr(stream, "size", 0)
+            info.original_verdict = "original"
+            info.quality = stream.label()
+            return stream.url, True
+        # 通道未开放 / 未登录 / 软失效：清掉旧直链，用 ladder 里的最高档
+        info.original_url = ""
+        info.original_verdict = "transcoded"
+        if getattr(info, "ladder_quality", ""):
+            info.quality = info.ladder_quality
+    url = getattr(info, "original_url", "") or info.play_url
+    return url, bool(getattr(info, "original_url", ""))
+
 
 def _get_session() -> requests.Session:
     """每个线程复用一个连接池：同一作品的多张图片/视频不再重复 TLS 握手。"""
@@ -251,7 +293,7 @@ def _download_to_file(url: str, target_path: str, progress: Optional[ProgressCal
                       index: int, total: int, timeout: int = 60,
                       timestamp: int = 0,
                       cancel_event: Optional[threading.Event] = None,
-                      byte_callback=None) -> int:
+                      byte_callback=None, chunk_size: int = 256 * 1024) -> int:
     """下载到 target_path（.part → rename），并设置文件时间为发布时间。
 
     支持断点续传：上次中断留下的 `.part` 会用 Range 继续；服务器不支持 Range 时自动重下。
@@ -294,7 +336,7 @@ def _download_to_file(url: str, target_path: str, progress: Optional[ProgressCal
             size = 0
             total_len = body_len
         with open(part, mode) as out:
-            for chunk in response.iter_content(chunk_size=256 * 1024):
+            for chunk in response.iter_content(chunk_size=chunk_size):
                 if cancel_event is not None and cancel_event.is_set():
                     raise DownloadCancelled("下载已取消")
                 if not chunk:
@@ -432,12 +474,29 @@ def download_work(info, author_folder: str, work_folder: str,
         result.count = n
     elif info.has_video():
         total = 2 if info.music_url else 1
-        ext = _guess_ext(info.play_url, "video")
+        video_url, is_original = _video_stream_url(info)
+        ext = _guess_ext(video_url, "video")
         target = os.path.join(video_dir, "视频" + ext)
-        result.size = _download_to_file(
-            info.play_url, target, progress, 0, total,
-            timestamp=timestamp, cancel_event=cancel_event,
-            byte_callback=byte_callback)
+        # 规范 Step 7：原片通常几十 MB，用 1 MB 分块；普通档保持 256 KB。
+        chunk = 1024 * 1024 if is_original else 256 * 1024
+        for attempt in (0, 1):
+            try:
+                result.size = _download_to_file(
+                    video_url, target, progress, 0, total,
+                    timestamp=timestamp, cancel_event=cancel_event,
+                    byte_callback=byte_callback, chunk_size=chunk)
+                break
+            except DownloadCancelled:
+                raise
+            except Exception:
+                if attempt == 0 and is_original:
+                    # CDN 直链有时效：清缓存重新回捞一次；仍失败就回退最高转码档。
+                    logging.warning("原画质直链下载失败，重新回捞一次：%s",
+                                    info.aweme_id, exc_info=True)
+                    video_url, is_original = _video_stream_url(info, force=True)
+                    chunk = 1024 * 1024 if is_original else 256 * 1024
+                    continue
+                raise
         result.video_path = target
         result.count = 1
         unit = 1

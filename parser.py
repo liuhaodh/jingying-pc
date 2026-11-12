@@ -22,6 +22,7 @@ from typing import Callable, Optional
 
 import config
 import links
+import original_stream
 from models import MediaInfo, find_detail, parse_aweme
 
 RESOLVER_PATH = os.path.join(config.ROOT, "resolver.js")
@@ -623,12 +624,17 @@ async def resolve_video(raw_input: str, stage: Optional[Callable[[str], None]] =
                 state = await page.evaluate(
                     "() => { const s = window.__JY_STATE__ || {};"
                     " return { detail: s.detail || '', play: s.play || '',"
-                    " meta: s.meta || {}, title: document.title }; }"
+                    " meta: s.meta || {}, title: document.title,"
+                    " url: location.href }; }"
                 )
             except Exception:
                 # 页面正在跳转/刷新时执行上下文会被销毁，等待后重试。
                 await asyncio.sleep(1.0)
                 continue
+            if original_stream.enabled() and original_stream.detect_challenge(
+                    state.get("url", ""), state.get("title", "")):
+                raise ParseError(
+                    "抖音要求人机校验。请先在「登录抖音」打开的有头浏览器里完成验证，再解析。")
             detail_text = state.get("detail", "")
             play_url = state.get("play", "")
             if detail_text:
@@ -651,6 +657,24 @@ async def resolve_video(raw_input: str, stage: Optional[Callable[[str], None]] =
                         except Exception:
                             pass
                     await say("解析完成")
+                    # 原画质回捞（默认关闭）：就在同一个已登录浏览器上下文里，
+                    # 用页面自己算好签名的 detail 数据打 play 端点。任何软失效
+                    # 都只记日志，绝不阻塞原本已经成功的最高转码档解析结果。
+                    if original_stream.enabled() and detail.get("video"):
+                        await say("正在核对原始码流…")
+                        try:
+                            stream = await original_stream.resolve_original(
+                                context, page, detail)
+                            info.original_verdict = stream.verdict
+                            if stream.is_original:
+                                info.ladder_quality = info.quality
+                                info.original_url = stream.url
+                                info.original_size = stream.size
+                                info.quality = stream.label()
+                        except Exception as exc:  # noqa: BLE001 - 原片通道未开放是正常结果
+                            info.original_verdict = "unavailable"
+                            logging.warning(
+                                "original stream unavailable, keep best gear: %s", exc)
                     return info
             except (ValueError, KeyError):
                 pass

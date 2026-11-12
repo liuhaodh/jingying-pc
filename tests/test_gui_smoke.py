@@ -11,6 +11,7 @@ from tests.support import isolated_config
 
 import config
 import downloader
+import original_stream
 import store as store_mod
 
 
@@ -39,6 +40,8 @@ class GuiSmokeTests(unittest.TestCase):
         self.window = None
         self.app.MainWindow._check_login = self._old_check
         self.app.MainWindow._start_maintenance = self._old_maint
+        original_stream.set_enabled(False)
+        downloader.set_original_resolver(None)
         self._ctx.__exit__(None, None, None)
 
     @classmethod
@@ -69,6 +72,29 @@ class GuiSmokeTests(unittest.TestCase):
         self.window.pack_tar_cb.setChecked(False)
         self.assertFalse(self.window._settings.get("pack_tar"))
         self.assertFalse(self.window.dm.pack_tar)
+
+    def test_original_quality_switch_defaults_off(self):
+        """原画质开关默认关：额外请求 + 体积暴涨，不能默认替用户打开。"""
+        cb = self.window.original_cb
+        self.assertIsNotNone(cb)
+        self.assertFalse(cb.isChecked())
+        self.assertFalse(self.window._original_flag)
+        self.assertFalse(original_stream.enabled())
+        self.assertIsNone(downloader._ORIGINAL_RESOLVER)
+        self.assertIn("回退最高转码档", cb.toolTip())
+        self.assertIn("本人作品", cb.toolTip())
+
+    def test_original_quality_switch_registers_resolver(self):
+        cb = self.window.original_cb
+        cb.setChecked(True)
+        self.assertTrue(self.window._settings.get("original_quality"))
+        self.assertTrue(self.window._original_flag)
+        self.assertTrue(original_stream.enabled())
+        self.assertIsNotNone(downloader._ORIGINAL_RESOLVER)
+        cb.setChecked(False)
+        self.assertFalse(self.window._settings.get("original_quality"))
+        self.assertFalse(original_stream.enabled())
+        self.assertIsNone(downloader._ORIGINAL_RESOLVER)
 
     def test_cloud_upgrade_switch_defaults_off(self):
         """新开关默认关、提示写清前置条件；没配 WebDAV 时不能勾。"""
