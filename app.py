@@ -2428,6 +2428,18 @@ def _log_file_handler(path):
                                backupCount=APP_LOG_BACKUPS, encoding="utf-8")
 
 
+def _flush_log_listener():
+    """退出前把队列里的日志写完，别丢掉最后几条。"""
+    listener = globals().get("_LOG_LISTENER")
+    if listener is None:
+        return
+    globals()["_LOG_LISTENER"] = None
+    try:
+        listener.stop()
+    except Exception:  # noqa: BLE001 - 退出流程不能被日志拖住
+        pass
+
+
 def _setup_logging():
     """启动日志：写到数据目录，程序异常时可用于排查。
 
@@ -2460,12 +2472,24 @@ def _setup_logging():
             log_path = ""
     if sys.stderr is not None:
         handlers.append(logging.StreamHandler())
-    if handlers:
+    if handlers and globals().get("_LOG_LISTENER") is None:
+        # 同步写盘会卡主线程：批量同步每秒几百条 skip / 滚动日志，本机安全钩子
+        # 下每条都要几毫秒，UI 看门狗抓到过 15~25s 卡顿（栈顶 _dl_item_skipped
+        # → logging.info）。改成日志只入内存队列，由后台线程异步落盘。
+        import atexit
+        import queue as _queue
+        from logging.handlers import QueueHandler, QueueListener
+
+        log_queue = _queue.Queue()
+        listener = QueueListener(log_queue, *handlers, respect_handler_level=True)
+        listener.start()
+        globals()["_LOG_LISTENER"] = listener
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s %(levelname)s %(message)s",
-            handlers=handlers,
+            handlers=[QueueHandler(log_queue)],
         )
+        atexit.register(_flush_log_listener)
     return log_path
 
 

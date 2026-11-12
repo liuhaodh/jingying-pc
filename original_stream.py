@@ -70,6 +70,14 @@ class OriginalStreamError(RuntimeError):
     """回捞链路的软失效（结构变化、风控兜底、未登录、CDN 头不对）。"""
 
 
+class SessionFailure(OriginalStreamError):
+    """会话级故障（浏览器起不来 / 未登录 / 人机校验）：需要冷却整轮回捞。
+
+    与「某个作品的 CDN 头异常」这类单作品软失效区分开：后者只该让当前作品
+    回退最高转码档，不能让接下来两分钟里的所有作品都跟着回退。
+    """
+
+
 @dataclass(frozen=True)
 class OriginalStream:
     video_id: str = ""
@@ -286,11 +294,15 @@ def cdn_info(headers, size_override: int = 0) -> tuple[int, str]:
     if not size:
         size = int(size_override or 0)
     content_type = header_get(headers, "content-type")
-    if size <= MIN_CDN_BYTES or not content_type.lower().startswith("video/"):
+    if size <= MIN_CDN_BYTES:
         raise OriginalStreamError(
-            f"断言 4 失败：CDN 头异常（{size} 字节 / {content_type or '无 Content-Type'}），"
-            "可能是降级流或占位流")
-    return size, content_type
+            f"断言 4 失败：CDN 体积异常（{size} 字节），可能是降级流或占位流")
+    if content_type and not content_type.lower().startswith("video/"):
+        raise OriginalStreamError(
+            f"断言 4 失败：CDN Content-Type 异常（{content_type}），可能是网页/占位流")
+    # 部分 GSLB 节点的 HEAD / Range 响应不返回 Content-Type，但总体积已经由
+    # Content-Range 确认。按视频处理即可，别把正常原片误判成会话级故障。
+    return size, content_type or "video/mp4"
 
 
 def need_range_fallback(headers, status: int) -> bool:
@@ -474,20 +486,23 @@ class OriginalSession:
             except Exception:  # noqa: BLE001 - 预热失败不致命，后面请求会给明确错误
                 logging.warning("original session: 预热访问首页失败", exc_info=True)
             if detect_challenge(page.url, page.title()):
-                raise OriginalStreamError("命中人机校验，请在「登录抖音」里人工处理后再试")
+                raise SessionFailure("命中人机校验，请在「登录抖音」里人工处理后再试")
             names = {c.get("name", "") for c in ctx.cookies()}
             if not names.intersection(_LOGIN_COOKIES):
-                raise OriginalStreamError(
+                raise SessionFailure(
                     "没有检测到登录状态。请先在程序里点「登录抖音」完成扫码；"
                     "未登录时 detail 常返回裁剪数据或只给低档流。")
-        except Exception:
+        except Exception as exc:
             # 失败时必须把浏览器关干净，否则下次 resolve 会拿到半初始化状态
             try:
                 ctx.close()
             except Exception:  # noqa: BLE001
                 pass
             pw.stop()
-            raise
+            if isinstance(exc, SessionFailure):
+                raise
+            # 浏览器启动/预热失败也是会话级问题，不能让每个作品都重启一次
+            raise SessionFailure(f"原画质浏览器会话不可用：{exc}") from exc
         self._page = page
         self._pw, self._ctx = pw, ctx
 
@@ -670,11 +685,17 @@ def resolve_for_download(video_id: str, best_size: int = 0,
         return None
     try:
         return _submit_to_session(_resolve_in_session, video_id, best_size, force)
-    except Exception as exc:  # noqa: BLE001 - 交给调用方记录并回退
+    except SessionFailure as exc:
+        # 只有浏览器/登录态整体不可用时才冷却，避免上千个作品反复重启 Chromium
         _FAILURE_UNTIL = time.monotonic() + FAILURE_COOLDOWN
         logging.warning("原画质回捞会话失败，冷却 %.0f 秒：%s",
                         FAILURE_COOLDOWN, exc)
         raise
+    except Exception as exc:  # noqa: BLE001 - 单作品软失效
+        # CDN 头异常、Location 缺失、白名单拒绝等只影响当前作品。以前一律
+        # 冷却 120 秒，会让之后两分钟的所有作品全部静默回退最高转码档。
+        logging.info("原画质探测不可用（%s），本作品回退最高转码档", exc)
+        return None
 
 
 atexit.register(close_session)

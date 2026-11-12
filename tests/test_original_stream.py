@@ -264,16 +264,16 @@ class CacheTests(unittest.TestCase):
         class Broken:
             def resolve(self, *args, **kwargs):
                 calls.append(args)
-                raise oq.OriginalStreamError("未登录")
+                raise oq.SessionFailure("未登录")
 
         with mock.patch.object(oq, "get_session", return_value=Broken()):
-            with self.assertRaises(oq.OriginalStreamError):
+            with self.assertRaises(oq.SessionFailure):
                 oq.resolve_for_download("v1", MB)
             self.assertIsNone(oq.resolve_for_download("v2", MB))
         self.assertEqual(len(calls), 1, "冷却期间不能每个作品都重启浏览器")
         oq.set_enabled(True)   # 用户重新打开开关 → 允许再试
         with mock.patch.object(oq, "get_session", return_value=Broken()):
-            with self.assertRaises(oq.OriginalStreamError):
+            with self.assertRaises(oq.SessionFailure):
                 oq.resolve_for_download("v3", MB)
         self.assertEqual(len(calls), 2)
 

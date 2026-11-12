@@ -97,15 +97,23 @@ class OriginalSessionThreadTests(unittest.TestCase):
         self.assertEqual(self.probe.close_tid, self.probe.tids[0])
         self.assertIsNone(oq._session)
 
-    def test_remote_exception_is_reraised_and_cools_down(self):
-        boom = RuntimeError("Cannot switch to a different thread")
-        oq._session = ProbeSession(exc=boom)
-        with self.assertRaisesRegex(RuntimeError, "different thread"):
+    def test_session_failure_is_reraised_and_cools_down(self):
+        oq._session = ProbeSession(exc=oq.SessionFailure("未登录"))
+        with self.assertRaises(oq.SessionFailure):
             oq.resolve_for_download("v9", 6_015_200)
         self.assertGreater(oq._FAILURE_UNTIL, 0)
         # 冷却期内不再打扰会话，静默回退最高转码档
         self.assertIsNone(oq.resolve_for_download("v10", 6_015_200))
         self.assertEqual(len(oq._session.calls), 1)
+
+    def test_single_work_soft_failure_does_not_cool_down(self):
+        """CDN 头异常只影响当前作品，不能让之后两分钟全部回退转码档。"""
+        soft = ProbeSession(exc=oq.OriginalStreamError("断言 4 失败：CDN 头异常"))
+        oq._session = soft
+        self.assertIsNone(oq.resolve_for_download("v11", 6_015_200))
+        self.assertEqual(oq._FAILURE_UNTIL, 0.0)
+        self.assertIsNone(oq.resolve_for_download("v12", 6_015_200))
+        self.assertEqual(len(soft.calls), 2, "下一个作品仍应尝试回捞")
 
     def test_batch_download_uses_original_url(self):
         """端到端：批量同步的多线程下载不再全部回退最高转码档。"""
@@ -128,6 +136,24 @@ class OriginalSessionThreadTests(unittest.TestCase):
             self.assertEqual(url, CDN)
             self.assertEqual(infos[i].original_verdict, "original")
             self.assertTrue(infos[i].quality.startswith("原始码流"))
+
+
+class CdnHeaderTests(unittest.TestCase):
+    def test_missing_content_type_accepted_when_size_is_plausible(self):
+        """部分 GSLB 节点不返回 Content-Type，但体积已由 Content-Range 确认。"""
+        self.assertEqual(oq.cdn_info({"content-length": "33169590"}),
+                         (33169590, "video/mp4"))
+        self.assertEqual(
+            oq.cdn_info({"content-range": "bytes 0-1023/40203845",
+                         "content-length": "1024"}),
+            (40203845, "video/mp4"))
+
+    def test_placeholder_and_non_video_still_rejected(self):
+        with self.assertRaises(oq.OriginalStreamError):
+            oq.cdn_info({"content-length": "1024"})
+        with self.assertRaises(oq.OriginalStreamError):
+            oq.cdn_info({"content-length": "200000",
+                         "content-type": "image/jpeg"})
 
 
 class OriginalCdnWhitelistTests(unittest.TestCase):

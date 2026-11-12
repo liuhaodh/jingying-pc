@@ -4,6 +4,26 @@
 窗口标题、exe 版本资源、便携目录 / zip 名、CHANGELOG 段落和 git tag 全部由它派生。
 版本规则遵循语义化版本：修复 bug 升 patch，功能/行为变更升 minor，破坏性变更升 major。
 
+## [v1.6.5] - 2026-11-13
+
+### 修复：第二轮真实同步监控暴露的两个回归
+
+- **一个作品的探测失败拖累整轮**：部分 GSLB 节点的 HEAD / Range 响应不返回
+  `Content-Type`（体积却正常，如 33 MB），`cdn_info` 断言 4 会抛
+  `OriginalStreamError`；`resolve_for_download` 以前对任何异常都冷却 120 秒，
+  于是一个作品的 CDN 头异常就让之后两分钟内所有作品静默回退最高转码档。
+  现在 `cdn_info` 只在体积过小或 Content-Type 明确不是视频时失败，缺
+  Content-Type 但体积合理按视频处理；并新增 `SessionFailure`，只有浏览器启动、
+  登录态、人机校验这类会话级故障才冷却，单作品软失效只回退当前作品。
+- **主线程同步写日志**：批量同步每秒数百条「云端已备份跳过」日志，
+  `logging.info` 在主线程直接落盘，本机安全钩子下 UI 看门狗抓到 15~25s 卡顿
+  （栈顶 `_dl_item_skipped`）。`_setup_logging` 改为 `QueueHandler` +
+  `QueueListener`，日志只入内存队列、由后台线程异步写盘，退出前 flush；
+  轮转 handler 与格式保持不变。
+- **回归**：`tests/test_original_session_thread.py` 新增 CDN 头、软失效不冷却
+  用例；`test_original_stream.py` 的会话失败用例改用 `SessionFailure`；
+  全量用例通过。
+
 ## [v1.6.4] - 2026-11-13
 
 ### 修复：批量同步时「原画质」开关实际不生效
