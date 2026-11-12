@@ -531,20 +531,33 @@ def _box(kind: bytes, payload: bytes) -> bytes:
     return struct.pack(">I", 8 + len(payload)) + kind + payload
 
 
-def _sample_entry(codec: bytes, width: int, height: int) -> bytes:
+def _sample_entry(codec: bytes, width: int, height: int, *, legacy=False) -> bytes:
+    # ISO BMFF：sample entry box 头 8 字节，宽高在 box 起始 +32，
+    # 即 _box 的 payload 内 +24。legacy=True 复现旧实现误读的 +40。
+    at = 32 if legacy else 24
     payload = bytearray(80)
-    payload[32:34] = struct.pack(">H", width)
-    payload[34:36] = struct.pack(">H", height)
+    payload[at:at + 2] = struct.pack(">H", width)
+    payload[at + 2:at + 4] = struct.pack(">H", height)
     return _box(codec, bytes(payload))
+
+
+def _tkhd(width: int, height: int, *, version=0) -> bytes:
+    """构造 tkhd，末尾是 16.16 定点的 width/height（音轨为 0）。"""
+    if version == 1:
+        body = (bytes([1]) + b"\x00" * 3 + b"\x00" * 16 + b"\x00" * 8
+                + b"\x00" * 8 + b"\x00" * 16 + b"\x00" * 36)
+    else:
+        body = b"\x00" * 24 + b"\x00" * 16 + b"\x00" * 36
+    return _box(b"tkhd", body + struct.pack(">II", width << 16, height << 16))
 
 
 def _stsd(entries: bytes, count: int = 1) -> bytes:
     return _box(b"stsd", b"\x00" * 4 + struct.pack(">I", count) + entries)
 
 
-def _trak(entry: bytes) -> bytes:
+def _trak(entry: bytes, tkhd: bytes = b"") -> bytes:
     stbl = _box(b"stbl", _stsd(entry))
-    return _box(b"trak", _box(b"mdia", _box(b"minf", stbl)))
+    return _box(b"trak", tkhd + _box(b"mdia", _box(b"minf", stbl)))
 
 
 def _mvhd(timescale=1000, duration=1200, version=0) -> bytes:
@@ -561,8 +574,10 @@ def _mvhd(timescale=1000, duration=1200, version=0) -> bytes:
 
 def _make_mp4(path: str, *, brand=b"qt  ", codec=b"hvc1", audio_first=False,
               meta=b"com.apple.quicktime.software iPhone 2025-06-06T16:52:08Z",
-              mdat_size=1_600_000, mdat_noise=b""):
-    traks = _trak(_sample_entry(codec, 3840, 2160))
+              mdat_size=1_600_000, mdat_noise=b"", dims=(3840, 2160),
+              legacy_layout=False, tkhd_dims=None):
+    traks = _trak(_sample_entry(codec, *dims, legacy=legacy_layout),
+                  _tkhd(*tkhd_dims) if tkhd_dims else b"")
     if audio_first:
         traks = _trak(_sample_entry(b"mp4a", 0, 0)) + traks
     moov = _box(b"moov", _mvhd() + traks + _box(b"udta", meta))
@@ -588,6 +603,38 @@ class Mp4InspectTests(unittest.TestCase):
         self.assertTrue(info["metadata"]["apple_software"])
         self.assertEqual(info["metadata"]["capture_time"], "2025-06-06T16:52:08Z")
         self.assertIn("原始上传码流特征充分", oq.file_verdict(info))
+
+    def test_spec_offset_matches_real_hevc_original(self):
+        # 真实原片：hvc1 + qt，宽高在 sample entry box+32，tkhd 也有 1080x1920
+        path = os.path.join(self.tmp, "real-layout.mp4")
+        _make_mp4(path, dims=(1080, 1920), tkhd_dims=(1080, 1920))
+        info = oq.inspect_mp4(path)
+        self.assertEqual(info["codecs"], ["hvc1"])
+        self.assertEqual((info["width"], info["height"]), (1080, 1920))
+
+    def test_legacy_plus40_layout_still_read(self):
+        # 旧实现按 box+40 读；保留兼容，避免历史/异种封装器退化为 0
+        path = os.path.join(self.tmp, "legacy-layout.mp4")
+        _make_mp4(path, dims=(720, 1280), legacy_layout=True)
+        self.assertEqual(
+            (oq.inspect_mp4(path)["width"], oq.inspect_mp4(path)["height"]),
+            (720, 1280))
+
+    def test_tkhd_fallback_when_stsd_has_no_dims(self):
+        path = os.path.join(self.tmp, "tkhd-only.mp4")
+        _make_mp4(path, dims=(0, 0), tkhd_dims=(1080, 1920))
+        info = oq.inspect_mp4(path)
+        self.assertEqual((info["width"], info["height"]), (1080, 1920))
+
+    def test_tkhd_v1_and_audio_track_zero_dims(self):
+        path = os.path.join(self.tmp, "tkhd-v1.mp4")
+        video = _trak(_sample_entry(b"hvc1", 0, 0), _tkhd(1080, 1920, version=1))
+        audio = _trak(_sample_entry(b"mp4a", 0, 0), _tkhd(0, 0))
+        moov = _box(b"moov", _mvhd() + audio + video)
+        with open(path, "wb") as f:
+            f.write(_box(b"ftyp", b"qt  ") + moov)
+        info = oq.inspect_mp4(path)
+        self.assertEqual((info["width"], info["height"]), (1080, 1920))
 
     def test_audio_track_first_does_not_hide_video_codec(self):
         path = os.path.join(self.tmp, "audio-first.mp4")

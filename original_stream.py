@@ -629,6 +629,57 @@ def _find_box(handle, start, end, target: bytes):
     return None
 
 
+def _plausible_dims(width, height):
+    return 16 <= width <= 8192 and 16 <= height <= 8192
+
+
+def _visual_dims(handle, pos, entry_size):
+    """读 VisualSampleEntry 的 width/height。
+
+    ISO BMFF 规定 sample entry 的 box 头占 8 字节，随后 6 字节 reserved、
+    2 字节 data_reference_index、16 字节 pre_defined，宽高在**box 起始 +32**。
+    早期实现误按 payload 起始再 +32（即 +40）读取，对真实 HEVC 文件读出 0；
+    这里以规范位置为主、+40 为兼容兜底，避免老数据/不同封装器失效。
+    """
+    for off in (32, 40):
+        if off + 4 > entry_size:
+            continue
+        handle.seek(pos + off)
+        raw = handle.read(4)
+        if len(raw) != 4:
+            continue
+        width = int.from_bytes(raw[:2], "big")
+        height = int.from_bytes(raw[2:], "big")
+        if _plausible_dims(width, height):
+            return width, height
+    return 0, 0
+
+
+def _scan_tkhd_dims(handle, moov_start, moov_end):
+    """stsd 没给宽高时，从视频轨 tkhd 的 16.16 定点宽高兜底（音轨为 0）。"""
+    best = (0, 0)
+    for kind, payload, box_end in media_probe._iter_boxes(handle, moov_start, moov_end):
+        if kind != b"trak":
+            continue
+        node = _find_box(handle, payload, box_end, b"tkhd")
+        if node is None:
+            continue
+        start, end = node
+        handle.seek(start)
+        head = handle.read(4)
+        version = head[0] if head else 0
+        off = 88 if version == 1 else 76
+        if start + off + 8 > end:
+            continue
+        handle.seek(start + off)
+        raw = handle.read(8)
+        width = int.from_bytes(raw[:4], "big") >> 16
+        height = int.from_bytes(raw[4:], "big") >> 16
+        if _plausible_dims(width, height) and width * height > best[0] * best[1]:
+            best = (width, height)
+    return best
+
+
 def _scan_stsd(handle, moov_start, moov_end):
     """遍历**所有** trak 找视频 sample entry（音轨可能排在前面）。"""
     codecs, dims = [], (0, 0)
@@ -655,14 +706,9 @@ def _scan_stsd(handle, moov_start, moov_end):
             etype = head[4:8]
             if etype in VIDEO_TAGS:
                 codecs.append(etype.decode("ascii", "replace"))
-                # 规范 8.1：sample entry 偏移 +32 / +34 是宽高
-                handle.seek(pos + 8 + 32)
-                raw = handle.read(4)
-                if len(raw) == 4:
-                    width = int.from_bytes(raw[:2], "big")
-                    height = int.from_bytes(raw[2:], "big")
-                    if width * height > dims[0] * dims[1]:
-                        dims = (width, height)
+                width, height = _visual_dims(handle, pos, esize)
+                if width * height > dims[0] * dims[1]:
+                    dims = (width, height)
             if esize <= 8:
                 break
             pos += esize
@@ -717,6 +763,8 @@ def inspect_mp4(path: str) -> dict:
         moov = media_probe._find_moov(handle, size)
         if moov is not None:
             codecs, dims = _scan_stsd(handle, moov[0], moov[1])
+            if not (dims[0] and dims[1]):
+                dims = _scan_tkhd_dims(handle, moov[0], moov[1])
             result["codecs"], result["width"], result["height"] = codecs, dims[0], dims[1]
             result["duration_s"] = round(_mvhd_duration(handle, moov[0], moov[1]), 3)
             handle.seek(moov[0])
