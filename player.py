@@ -28,6 +28,11 @@ import theme
 # 图集多张照片时的自动切换间隔（毫秒）
 SLIDESHOW_INTERVAL_MS = 3000
 
+# 长按画面进入倍速播放：按住超过这个时长且没有拖动才触发
+LONG_PRESS_MS = 450
+# 长按时的倍速
+SPEED_RATE = 2.0
+
 
 def _remove_tree(path, attempts=4, delay=0.05):
     """删掉一个目录，删不掉就短暂重试几次。
@@ -74,9 +79,23 @@ class PlayerWindow(QWidget):
         self._visible_indices = []
         self.page = 1
         self._pix_cache = {}
+        # 实况图首帧是否已就绪：setSource() 是异步的，就绪前先显示静态图，
+        # 否则切图瞬间会残留上一张实况的最后一帧（看起来就是「没切过去」）。
+        self._live_ready = False
+        # 长按倍速状态
+        self._press_pos = None
+        self._speed_active = False
+        self._speed_media = None
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
         self._resize_timer.timeout.connect(self._render_image)
+        self._long_press_timer = QTimer(self)
+        self._long_press_timer.setSingleShot(True)
+        self._long_press_timer.timeout.connect(self._on_long_press_timeout)
+        # 部分解码后端不上报 BufferedMedia，超时后强制翻页，避免停在静态图上
+        self._live_fallback = QTimer(self)
+        self._live_fallback.setSingleShot(True)
+        self._live_fallback.timeout.connect(self._force_show_live)
 
         self.setWindowTitle("净影 · 观看已下载")
         import theme; self.setStyleSheet(theme.APP_QSS)
@@ -227,6 +246,15 @@ class PlayerWindow(QWidget):
             child.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.info_overlay.installEventFilter(self)
         self.info_overlay.hide()
+
+        # 倍速提示：作为 stack 的兄弟节点放在画面右上角，长按时才显示。
+        self.speed_badge = QLabel(left)
+        self.speed_badge.setStyleSheet(
+            "background:rgba(17,24,39,190);color:#ffffff;border-radius:12px;"
+            "padding:6px 12px;font-size:13px;font-weight:700;")
+        self.speed_badge.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.speed_badge.hide()
 
         # 底部进度与按钮
         panel = QWidget(left)
@@ -504,12 +532,17 @@ class PlayerWindow(QWidget):
         ts = int(item.get("time") or 0)
         time_text = _time.strftime("%Y-%m-%d %H:%M", _time.localtime(ts)) if ts else "时间未知"
         self.meta_label.setText(f"发布时间：{time_text}")
+        self._end_long_press_speed()
+        self._live_fallback.stop()
         self.player.stop()
         self.music_player.stop()
         self.live_player.stop()
         self.image_timer.stop()
 
         if item.get("type") == "album":
+            # 先清掉上一张：新作品的大图解码/读盘慢时，界面上不能还留着
+            # 上一个作品的照片（看起来就是「切了还是上一张」）。
+            self.image_label.clear()
             self.stack.setCurrentWidget(self.image_label)
             self.seek.setRange(0, max(1, len(item.get("images") or [])) - 1)
             self.seek.setValue(0)
@@ -616,19 +649,27 @@ class PlayerWindow(QWidget):
         if live and os.path.exists(live):
             # 实况图：多图时只播一遍，播放结束后再切下一张；单图时循环播放
             self.image_timer.stop()
+            self.live_player.stop()
+            self.live_player.setSource(QUrl())
             self._live_current = live
+            self._live_ready = False
             self.live_player.setLoops(
                 QMediaPlayer.Loops.Once if len(images) > 1 else QMediaPlayer.Loops.Infinite)
-            self.stack.setCurrentWidget(self.live_widget)
+            # 先显示这一张的静态图：QMediaPlayer 换源是异步的，直接切到实况页
+            # 会停留上一张实况的最后一帧（表现为「滑动后还是第一张」）。
+            self.stack.setCurrentWidget(self.image_label)
+            self._render_image()
             self._layout_video_items()
             self.live_player.setSource(QUrl.fromLocalFile(os.path.abspath(live)))
             self.live_player.play()
+            self._live_fallback.start(900)
             self.seek.setValue(self.image_index)
             self.time_label.setText(f"实况 {self.image_index + 1}/{len(images)}")
             self._raise_overlay()
             return
         self._live_current = ""
         self.live_player.stop()
+        self.image_label.clear()
         self.stack.setCurrentWidget(self.image_label)
         self._render_image()
         self._raise_overlay()
@@ -638,6 +679,18 @@ class PlayerWindow(QWidget):
             self.image_timer.start(SLIDESHOW_INTERVAL_MS)
 
     def _on_live_status(self, status):
+        # 首帧可用时才把实况页翻上来：换源期间 stack 一直显示静态图，
+        # 不会出现「切了图却还是上一张」的残留画面。
+        if status in (QMediaPlayer.MediaStatus.LoadedMedia,
+                      QMediaPlayer.MediaStatus.BufferedMedia):
+            if (self._live_current and not self._live_ready and self.feed
+                    and self.feed[self.index].get("type") == "album"):
+                self._live_ready = True
+                self._live_fallback.stop()
+                self.stack.setCurrentWidget(self.live_widget)
+                self._layout_video_items()
+                self._raise_overlay()
+            return
         if status != QMediaPlayer.MediaStatus.EndOfMedia or not self._live_current:
             return
         item = self.feed[self.index] if self.feed else {}
@@ -646,6 +699,21 @@ class PlayerWindow(QWidget):
             return
         token = self._live_token
         QTimer.singleShot(0, lambda: self._advance_after_live(token))
+
+    def _force_show_live(self):
+        """首帧信号迟迟不来（后端差异）时按超时翻页，别一直停在静态图。"""
+        if not (self._live_current and not self._live_ready and self.feed):
+            return
+        item = self.feed[self.index]
+        if item.get("type") != "album":
+            return
+        videos = item.get("videos") or []
+        if self.image_index < len(videos) and videos[self.image_index] != self._live_current:
+            return
+        self._live_ready = True
+        self.stack.setCurrentWidget(self.live_widget)
+        self._layout_video_items()
+        self._raise_overlay()
 
     def _on_live_error(self, _error, _message):
         if not self._live_current:
@@ -682,7 +750,27 @@ class PlayerWindow(QWidget):
             self._pix_cache[path] = (mtime, pix)
         return pix
 
+    @staticmethod
+    def _scale_pixmap(pix, width, height):
+        """按可用尺寸缩放；远大于显示区时先快速折半，再平滑收尾。
+
+        真实图集原图常见 1080×1920 甚至更大，直接 SmoothTransformation
+        缩到播放区要几十到上百毫秒，切图会明显卡一下。
+        """
+        width = max(1, int(width))
+        height = max(1, int(height))
+        step = pix
+        while step.width() > width * 2 or step.height() > height * 2:
+            step = step.scaled(max(1, step.width() // 2), max(1, step.height() // 2),
+                               Qt.AspectRatioMode.KeepAspectRatio,
+                               Qt.TransformationMode.FastTransformation)
+        return step.scaled(width, height,
+                           Qt.AspectRatioMode.KeepAspectRatio,
+                           Qt.TransformationMode.SmoothTransformation)
+
     def _render_image(self):
+        if not self.feed:
+            return
         item = self.feed[self.index]
         images = item.get("images") or []
         if not images:
@@ -693,11 +781,16 @@ class PlayerWindow(QWidget):
         if pix.isNull():
             self.image_label.setText("图片无法加载")
             return
+        # 窗口刚创建时 stack 还没完成布局，直接用它的尺寸会把第一张兜底成
+        # 100×66 的小图；依次回退到 label / 窗口尺寸，都没有就等 resize 再画。
         avail = self.stack.size()
-        scaled = pix.scaled(
-            max(100, avail.width() - 12), max(100, avail.height() - 12),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation)
+        if avail.width() < 120 or avail.height() < 120:
+            avail = self.image_label.size()
+        if avail.width() < 120 or avail.height() < 120:
+            avail = self.size()
+        if avail.width() < 120 or avail.height() < 120:
+            return
+        scaled = self._scale_pixmap(pix, avail.width() - 12, avail.height() - 12)
         self.image_label.setText("")
         self.image_label.setPixmap(scaled)
 
@@ -864,15 +957,24 @@ class PlayerWindow(QWidget):
                 return True
             if event.type() == QEvent.Type.MouseButtonPress and isinstance(event, QMouseEvent):
                 self._drag_start = event.position()
+                self._press_pos = event.position()
                 self._drag_active = False
+                # 按住不动超过 LONG_PRESS_MS 进入倍速；一移动就取消
+                self._long_press_timer.start(LONG_PRESS_MS)
             elif event.type() == QEvent.Type.MouseMove and isinstance(event, QMouseEvent):
                 if self._drag_start is not None:
                     dx = abs(event.position().x() - self._drag_start.x())
                     dy = abs(event.position().y() - self._drag_start.y())
                     if dx > 12 or dy > 12:
                         self._drag_active = True
+                        self._long_press_timer.stop()
+                        self._end_long_press_speed()
             elif event.type() == QEvent.Type.MouseButtonRelease and isinstance(event, QMouseEvent):
                 if self._drag_start is not None:
+                    self._long_press_timer.stop()
+                    # 长按倍速刚结束时不要顺手当成「单击暂停」
+                    was_speed = self._speed_active or self.speed_badge.isVisible()
+                    self._end_long_press_speed()
                     dx = event.position().x() - self._drag_start.x()
                     dy = event.position().y() - self._drag_start.y()
                     if self._drag_active and max(abs(dx), abs(dy)) > 70:
@@ -883,17 +985,87 @@ class PlayerWindow(QWidget):
                                 self.next() if dx < 0 else self.prev()
                         else:
                             self.next() if dy < 0 else self.prev()
-                    elif not self._drag_active:
+                    elif not self._drag_active and not was_speed:
                         if not self.info_visible:
                             # 文案被隐藏时，单击画面先恢复文案
                             self._toggle_info(True)
                         else:
                             self.toggle_play()
                     self._drag_start = None
+                    self._press_pos = None
                     self._drag_active = False
             elif event.type() == QEvent.Type.MouseButtonDblClick:
                 self._toggle_fullscreen()
         return super().eventFilter(obj, event)
+
+    # ---------- 长按倍速 ----------
+    def _speed_target(self):
+        """当前能变速的播放器：视频用主播放器，实况图用实况播放器。
+
+        纯图片图集没有视频轨道，返回 None —— 这类作品谈不上倍速，
+        长按时直接提示，避免用户以为「按了没反应」。
+        """
+        item = self.feed[self.index] if self.feed else {}
+        if item.get("type") == "album":
+            return self.live_player if self._live_current else None
+        return self.player
+
+    def _on_long_press_timeout(self):
+        """定时器到点：确实是「按住不动」才进入倍速。"""
+        if self._drag_active or self._drag_start is None:
+            return
+        self._begin_long_press_speed()
+
+    def _begin_long_press_speed(self):
+        target = self._speed_target()
+        if target is None:
+            self._show_speed_badge("图集不支持倍速")
+            return
+        try:
+            target.setPlaybackRate(SPEED_RATE)
+            actual = target.playbackRate()
+        except RuntimeError:  # 底层对象已销毁
+            return
+        if abs(actual - SPEED_RATE) < 0.01:
+            self._speed_active = True
+            self._speed_media = target
+            self._show_speed_badge(f"{SPEED_RATE:g}× 倍速播放中")
+        else:
+            # 解码后端（Windows Media Foundation / FFmpeg）不支持变速时，
+            # playbackRate 会被钳回 1.0：这里明确提示「不支持」，
+            # 而不是让用户对着没变化的画面猜。
+            self._show_speed_badge("当前作品不支持倍速")
+
+    def _end_long_press_speed(self):
+        if self._speed_media is not None:
+            try:
+                self._speed_media.setPlaybackRate(1.0)
+            except RuntimeError:
+                pass
+            self._speed_media = None
+        self._speed_active = False
+        self._hide_speed_badge()
+
+    def _show_speed_badge(self, text):
+        if getattr(self, "speed_badge", None) is None:
+            return
+        self.speed_badge.setText(text)
+        self.speed_badge.adjustSize()
+        self.speed_badge.show()
+        self.speed_badge.raise_()
+        self._layout_speed_badge()
+
+    def _hide_speed_badge(self):
+        if getattr(self, "speed_badge", None) is not None:
+            self.speed_badge.hide()
+
+    def _layout_speed_badge(self):
+        if getattr(self, "speed_badge", None) is None or not self.speed_badge.isVisible():
+            return
+        rect = self.stack.geometry()
+        x = rect.x() + max(0, rect.width() - self.speed_badge.width() - 24)
+        y = rect.y() + 20
+        self.speed_badge.move(x, y)
 
     def _switch_by_wheel(self, delta):
         if delta == 0:
@@ -941,12 +1113,17 @@ class PlayerWindow(QWidget):
         if not getattr(self, "_shown_once", False):
             self._shown_once = True
             self.showMaximized()
+        # 窗口拿到真实尺寸后按当前布局重画一次：构造时的渲染可能还没算完
+        # 布局，用的是兜底尺寸。
+        if self.feed and self.feed[self.index].get("type") == "album":
+            QTimer.singleShot(0, self._render_image)
         self.setFocus()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._layout_video_items()
         self._layout_info_overlay()
+        self._layout_speed_badge()
         if self.feed and self.feed[self.index].get("type") == "album":
             # 拖动窗口时合并连续 resize，避免每一帧都缩放整张原图
             self._resize_timer.start(80)

@@ -882,13 +882,8 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, PlayerMixin, QWidget):
         title.setStyleSheet("font-size:20px;font-weight:700;color:#1f2937;")
         header.addWidget(title)
         header.addStretch(1)
-        self.watch_btn = QPushButton("观看已下载")
-        self.watch_btn.setStyleSheet(
-            "QPushButton{background:#2563eb;color:#ffffff;border:none;"
-            "border-radius:8px;padding:8px 18px;font-weight:600;}"
-            "QPushButton:hover{background:#1d4ed8;}")
-        self.watch_btn.clicked.connect(self._open_player)
-        header.addWidget(self.watch_btn)
+        # 「观看已下载」入口已按需求移除：本版本不再内置播放器，
+        # 下载产物（作品文件夹或 tar）交给系统里的播放器打开。
         self.account_combo = QComboBox()
         self.account_combo.addItems([f"账号 {i + 1}" for i in range(self._account_count)])
         self.account_combo.setFixedWidth(126)
@@ -1103,14 +1098,17 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, PlayerMixin, QWidget):
         self.pack_tar_cb.setChecked(bool(self._settings.get("pack_tar", False)))
         self.pack_tar_cb.setToolTip(
             "选中后每个作品下载完打成一个 <作品id>.tar 并删除散文件，\n"
-            "WebDAV 也只上传这个 tar。作品仍可在播放器里观看（按需解包）。")
+            "WebDAV 也只上传这个 tar。tar 不能直接播放，要先解包，\n"
+            "解包后拖动进度、预览都会变慢。")
         self.pack_tar_cb.setStyleSheet("font-size:11px;color:#4b5563;")
         self.pack_tar_cb.toggled.connect(self._set_pack_tar)
         pack_row.addWidget(self.pack_tar_cb)
         # 用户要求：开关后面直接跟一句代价提示，避免只看到「省空间」就勾上。
         self.pack_tar_hint = QLabel("可能会影响播放性能")
         self.pack_tar_hint.setStyleSheet("color:#b45309;font-size:11px;")
-        self.pack_tar_hint.setToolTip("播放 tar 里的作品时先解包到临时目录，首次打开会稍慢")
+        self.pack_tar_hint.setToolTip(
+            "tar 是压缩归档，不能直接播放：每次观看都要先解包。\n"
+            "如果主要在电脑上直接看，建议不勾选，保持作品文件夹。")
         pack_row.addWidget(self.pack_tar_hint)
         pack_row.addStretch(1)
         wl.addLayout(pack_row)
