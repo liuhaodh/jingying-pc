@@ -886,13 +886,16 @@ Playwright 20 秒默认超时约束，极端情况还是会走兜底强杀；这
 python tools/original_cli.py login-status                   # 本地登录 Cookie 是否在
 python tools/original_cli.py probe <你的作品链接或ID>        # 只读：不发下载请求，打印 factor/verdict
 python tools/original_cli.py download <你的作品链接或ID> --out D:\归档
+python tools/original_cli.py compare  <你的作品链接或ID> --out D:\归档  # 两档编码对比
 python tools/original_cli.py check D:\归档\视频.mp4           # 编码/元数据/码率结构判定
 python tools/original_cli.py regress                        # 离线回归，失败返回非零退出码
 ```
 
 CLI 面向**源码运行**（打包版请用界面开关）；`probe` 只发 `play` + `HEAD`
 两个请求，适合先确认通道是否开放；`download` 会把结果写成
-`original_probe.json` 便于复核。`regress` 不需要网络，可以直接挂
+`original_probe.json` 便于复核。`compare` 复用已落盘的原片、只补下最高转码档，
+写出 `original_compare.json`；编码被更换（如 HEVC → H.264）即「转码档经过重编码」
+的硬证据（验收清单第 4 条）。`regress` 不需要网络，可以直接挂
 每日定时任务——抖音的失效大多是静默的（HTTP 200 但字段被裁剪），当天就该发现。
 
 ---

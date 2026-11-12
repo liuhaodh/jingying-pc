@@ -5,6 +5,7 @@
 软失效断言、第 8 节 MP4 结构检查，以及本项目解析/下载链路的接入点。
 """
 import asyncio
+import json
 import os
 import struct
 import tempfile
@@ -721,6 +722,75 @@ class CliDownloadTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+
+class CompareCliTests(unittest.TestCase):
+    """验收清单 4：原片 vs 最高转码档，全程离线（mock 掉浏览器与 CDN）。"""
+
+    def setUp(self):
+        import importlib.util
+        self.tmp = tempfile.mkdtemp(prefix="jy-compare-")
+        cli_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "tools", "original_cli.py")
+        spec = importlib.util.spec_from_file_location(
+            "jy_original_cli_compare", cli_path)
+        self.cli = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.cli)
+
+    def _run(self, *, original_codec=b"hvc1", gear_codec=b"avc1",
+             preplace=False):
+        calls = []
+        original_path = os.path.join(self.tmp, "视频.mp4")
+        stream_size = 0
+        if preplace:
+            _make_mp4(original_path, codec=original_codec, mdat_size=1000)
+            stream_size = os.path.getsize(original_path)
+
+        def fake_download(url, target, timeout=120):
+            calls.append((url, target))
+            codec = gear_codec if "最高转码档" in target else original_codec
+            _make_mp4(target, codec=codec, mdat_size=1000)
+            return os.path.getsize(target)
+
+        stream = oq.OriginalStream(
+            video_id="v0200fg10000abcdef", url=CDN, size=stream_size,
+            best_size=6015200, best_gear="normal_1080_0", factor=3.724,
+            verdict="original", content_type="video/mp4")
+
+        class FakeSession:
+            def resolve(self, vid, size, force=False):
+                return stream
+
+        with mock.patch.object(self.cli, "capture_detail", return_value=_detail()), \
+                mock.patch.object(oq, "get_session", return_value=FakeSession()), \
+                mock.patch.object(oq, "close_session"), \
+                mock.patch.object(self.cli, "download_cdn",
+                                  side_effect=fake_download):
+            rc = self.cli.compare("https://v.douyin.com/abc", out_dir=self.tmp)
+        self.assertEqual(rc, 0)
+        with open(os.path.join(self.tmp, "original_compare.json"),
+                  encoding="utf-8") as handle:
+            return json.load(handle), calls
+
+    def test_codec_change_is_detected_and_saved(self):
+        result, calls = self._run()
+        self.assertEqual(result["original"]["codecs"], ["hvc1"])
+        self.assertEqual(result["transcoded"]["codecs"], ["avc1"])
+        self.assertTrue(result["codec_changed"])
+        self.assertEqual(result["best_gear"], "normal_1080_0")
+        self.assertEqual(len(calls), 2)
+        self.assertIn("编码被更换", result["conclusion"])
+
+    def test_existing_original_is_reused(self):
+        result, calls = self._run(preplace=True)
+        self.assertTrue(result["original_reused"])
+        self.assertEqual(len(calls), 1, "已有原片时只应下载转码档")
+
+    def test_same_codec_is_not_hard_evidence(self):
+        result, _ = self._run(gear_codec=b"hvc1")
+        self.assertFalse(result["codec_changed"])
+        self.assertIn("仅凭编码无法证明", result["conclusion"])
 
 
 if __name__ == "__main__":

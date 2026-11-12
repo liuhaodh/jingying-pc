@@ -7,8 +7,13 @@
     python tools/original_cli.py login-status
     python tools/original_cli.py probe <作品链接或ID>
     python tools/original_cli.py download <作品链接或ID> [--out 目录]
+    python tools/original_cli.py compare <作品链接或ID> [--out 目录]
     python tools/original_cli.py check <视频.mp4>
     python tools/original_cli.py regress          # 离线，可挂定时任务
+
+`compare` 对应验收清单第 4 条：把原片与 `bit_rate` 里体积最大的转码档都落到本地，
+对比编码、分辨率、码率；编码被更换（如 HEVC → H.264）是「转码档经过重编码」的硬证据。
+已存在的原片文件会按大小复用，不重复下载大文件。
 
 `regress` 不需要网络，失败返回非零退出码，可直接挂每日定时任务做静默失效巡检。
 """
@@ -184,6 +189,78 @@ def download(raw_input: str, out_dir: str = ""):
         oq.close_session()
 
 
+def _brief(info: dict) -> dict:
+    return {
+        "bytes": info["bytes"], "brand": info["brand"], "codecs": info["codecs"],
+        "width": info["width"], "height": info["height"],
+        "duration_s": info["duration_s"],
+        "avg_bitrate_kbps": info["avg_bitrate_kbps"],
+        "capture_time": (info["metadata"] or {}).get("capture_time", ""),
+    }
+
+
+def compare(raw_input: str, out_dir: str = ""):
+    """验收清单 4：原片 vs 最高转码档，编码被更换即为重编码硬证据。"""
+    session = oq.get_session()
+    try:
+        detail = capture_detail(raw_input, session)
+        oq.assert_detail(detail)
+        gear = oq.best_gear(detail["video"])
+        stream = session.resolve(oq.video_id_of(detail), gear["size"])
+        aweme_id = str(detail.get("aweme_id") or "unknown")
+        target_dir = out_dir or os.path.join(
+            config.DATA_DIR, "original_downloads", aweme_id)
+        os.makedirs(target_dir, exist_ok=True)
+        original_path = os.path.join(target_dir, "视频.mp4")
+        gear_path = os.path.join(target_dir, "视频-最高转码档.mp4")
+
+        # 原片较大，本地已有且字节数吻合时直接复用，不重复采集。
+        expected = int(stream.size) if stream and stream.is_original else 0
+        reuse = (os.path.isfile(original_path)
+                 and (not expected or os.path.getsize(original_path) == expected))
+        if not reuse:
+            if not (stream and stream.is_original and stream.url):
+                raise oq.OriginalStreamError(
+                    "本地没有原片，且该作品拿不到原片直链，无法做对比")
+            download_cdn(stream.url, original_path)
+
+        gear_url = models._clean_url(gear["url"])
+        if not gear_url:
+            raise oq.OriginalStreamError("最高转码档没有可用直链")
+        if not os.path.isfile(gear_path):
+            download_cdn(gear_url, gear_path)
+
+        a, b = oq.inspect_mp4(original_path), oq.inspect_mp4(gear_path)
+        changed = oq.codec_changed(a, b)
+        result = {
+            "aweme_id": aweme_id,
+            "best_gear": gear["gear_name"],
+            "declared_gear_size": gear["size"],
+            "actual_gear_bytes": b["bytes"],
+            "original_reused": reuse,
+            "original": _brief(a),
+            "transcoded": _brief(b),
+            "codec_changed": changed,
+            "size_ratio": round(a["bytes"] / b["bytes"], 3) if b["bytes"] else 0,
+            "bitrate_ratio": round(a["avg_bitrate_kbps"] / b["avg_bitrate_kbps"], 3)
+            if b["avg_bitrate_kbps"] else 0,
+            "verdict": stream.verdict if stream else "transcoded",
+            "factor": round(stream.factor, 3) if stream else 0,
+            "conclusion": (
+                "编码被更换，是「最高转码档经过重编码」的硬证据；"
+                "原片码流疑似未经重编码（容器/元数据仍被平台重封装）。"
+                if changed else
+                "两档编码相同，仅凭编码无法证明重编码；请结合体积倍率与元数据判断。"),
+        }
+        with open(os.path.join(target_dir, "original_compare.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump(result, handle, ensure_ascii=False, indent=2)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    finally:
+        oq.close_session()
+
+
 def check(path: str):
     info = oq.inspect_mp4(path)
     info["verdict"] = oq.file_verdict(info)
@@ -249,6 +326,9 @@ def main(argv=None):
     p = sub.add_parser("download", help="探测并下载（拿不到原片自动回退最高转码档）")
     p.add_argument("target", help="作品链接 / 分享文案 / 纯数字 ID")
     p.add_argument("--out", default="", help="输出目录")
+    p = sub.add_parser("compare", help="原片 vs 最高转码档编码对比（验收清单 4）")
+    p.add_argument("target", help="作品链接 / 分享文案 / 纯数字 ID")
+    p.add_argument("--out", default="", help="输出目录")
     p = sub.add_parser("check", help="检查已下载 MP4 的编码/元数据/码率")
     p.add_argument("path", help="本地 mp4 路径")
     sub.add_parser("regress", help="离线回归：规范三个实测样本")
@@ -260,6 +340,8 @@ def main(argv=None):
             return probe(args.target)
         if args.command == "download":
             return download(args.target, args.out)
+        if args.command == "compare":
+            return compare(args.target, args.out)
         if args.command == "check":
             return check(args.path)
         if args.command == "regress":
