@@ -8,10 +8,51 @@ import sys
 import time
 
 APP_NAME = "净影"
-APP_VERSION = "1.0.0"
+# 唯一版本真源：窗口标题 / exe 版本资源 / CHANGELOG / zip 名 / git tag 全部
+# 从这里读。发版时只改这一行，再执行 `python build_release.py`；不要在其他
+# 地方手写版本号，否则又会出现「改了代码但版本号不变」。
+APP_VERSION = "1.1.0"
 
 # 项目根目录（随脚本位置）
 ROOT = os.path.dirname(os.path.abspath(__file__))
+
+_BUILD_SHA_CACHE = None
+
+
+def build_sha() -> str:
+    """发行包的构建短 sha；源码运行（含测试）返回空串。
+
+    构建脚本会把 git 短 sha 写进 exe 同目录的 build_sha.txt，只有打包产物
+    带这个文件。这样同一版本号的不同构建也能从标题上区分；开发态标题保持
+    稳定，不会被构建产物影响（GUI 冒烟测试也依赖这一点）。
+    """
+    global _BUILD_SHA_CACHE
+    if _BUILD_SHA_CACHE is not None:
+        return _BUILD_SHA_CACHE
+    _BUILD_SHA_CACHE = ""
+    if not getattr(sys, "frozen", False):
+        return _BUILD_SHA_CACHE
+    bases = (os.path.dirname(os.path.abspath(sys.executable)),
+             getattr(sys, "_MEIPASS", "") or "")
+    for base in bases:
+        if not base:
+            continue
+        try:
+            with open(os.path.join(base, "build_sha.txt"), "r", encoding="utf-8") as f:
+                sha = f.read().strip().split()[0]
+        except (OSError, IndexError, UnicodeError):
+            continue
+        if sha and sha.lower() != "nogit":
+            _BUILD_SHA_CACHE = sha[:12]
+            break
+    return _BUILD_SHA_CACHE
+
+
+def window_title() -> str:
+    """窗口标题的唯一生成入口（app.py 与测试共用）。"""
+    title = f"{APP_NAME} · 电脑版 v{APP_VERSION}"
+    sha = build_sha()
+    return f"{title} ({sha})" if sha else title
 
 
 def _app_dir() -> str:

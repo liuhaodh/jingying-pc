@@ -51,7 +51,8 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIsNotNone(self.window.upload_panel.list)
         self.assertIsNotNone(self.window.history_list)
         self.assertIsNotNone(self.window.contact_list)
-        self.assertEqual(self.window.windowTitle(), f"{config.APP_NAME} · 电脑版 v{config.APP_VERSION}")
+        self.assertEqual(self.window.windowTitle(), config.window_title())
+        self.assertIn(f"v{config.APP_VERSION}", self.window.windowTitle())
         self.assertEqual(self.window.download_panel.progress.value(), 0)
         self.assertEqual(self.window.upload_panel.progress.value(), 0)
 

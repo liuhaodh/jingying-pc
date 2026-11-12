@@ -14,8 +14,10 @@
 
 **方式一：免安装 exe（推荐）**
 
-解压 `JingYing-PC-v1.0.0-win64.zip`，双击 `JingYingPC.exe` 即可打开图形界面，
-无需安装 Python。首次使用前请确认电脑上有 Google Chrome 或 Microsoft Edge。
+解压发行 zip（文件名由发版脚本按版本自动生成：`净影-PC-v<版本>-win64.zip`，
+版本号见 `config.py` 的 `APP_VERSION` 或 `CHANGELOG.md`），双击 `JingYingPC.exe`
+即可打开图形界面，无需安装 Python。首次使用前请确认电脑上有 Google Chrome
+或 Microsoft Edge。
 
 **方式二：Python 源码运行**
 
@@ -29,6 +31,36 @@ python app.py --selftest
 
 ---
 
+## 版本与发版
+
+版本唯一真源是 `config.py` 的 `APP_VERSION`（语义化版本），窗口标题、exe 版本资源、
+便携目录 / zip 名、CHANGELOG、git tag 全部由它派生，**不要在其他地方手写版本号**。
+
+| 位置 | 来源 |
+|---|---|
+| 窗口标题 | `config.window_title()`；发行包额外带构建短 sha |
+| exe 属性 | `file_version_info.txt`，每次发版按版本重新生成 |
+| 启动日志 | `app.log` 的 `version=... build=...` 行 |
+| 产物名 | `净影-便携版-v<版本>/`、`净影-PC-v<版本>-win64.zip` |
+| 更新日志 | `CHANGELOG.md` |
+| git tag / Release | `v<版本>` |
+
+发版流程（改完代码、跑完测试后）：
+
+1. 按语义化版本修改 `config.APP_VERSION`；在 `CHANGELOG.md` 补该版本段落
+   （没写时脚本会从 git log 自动补一节）。
+2. `python build_release.py`：依次跑全量测试、PyInstaller 构建、组装带登录态的
+   便携目录、压缩、CRC 校验，产物默认输出到桌面。
+   - 干净包（不带 Cookie / 通讯录 / 历史）加 `--no-data`；
+   - 复用已有构建加 `--skip-build`；CI 已跑测试加 `--skip-tests`；
+   - 同名产物默认不覆盖，`--force` 会把旧产物改名备份后重建。
+3. `git tag -a v<版本> -m '...'`，推送后在 GitHub 建 Release 并挂上对应 zip。
+
+> 便携包里的 `VERSION.txt` / `build_sha.txt` 与窗口标题括号里的短 sha，
+> 用于在反馈问题时定位具体构建。
+
+---
+
 ## 功能（对齐 Android v1.3.0）
 
 - **无水印视频（原画质）**：读取网页播放器实际使用的地址，天然不带水印；并在清晰度
@@ -38,8 +70,9 @@ python app.py --selftest
 - **图集作品**：按顺序保存整组图片。
 - **主页批量下载**：粘贴创作者主页链接，自动滚动加载，一键下载全部作品
   （视频 + 图集 + 背景音乐），支持失败计数。
-- **通讯录自动同步**：把作者主页「加入通讯录」，每次打开自动下载该作者全部作品；
-  支持全部同步、失败重试、删除。
+- **通讯录同步**：把作者主页「加入通讯录」，点「全部同步」下载各作者全部作品；
+  支持失败重试、删除。当前版本打开程序**不会**自动开始同步（`_auto_sync` 尚未接入
+  启动流程），需要手动点「全部同步」。
 - **三块独立窗口**：通讯录、传输、最近保存各自一个窗口，从主界面按钮打开
   （按钮上带作者数/作品数）；关闭只是隐藏，后台任务仍在继续，再次打开内容还在。
 - **同步日志**：主界面「查看日志」打开独立窗口，记录整体「开始同步 / 同步结束」、

@@ -39,3 +39,9 @@ portable.flag
 JingYing-PC-*/
 *.db
 *.json.migrated
+
+# 发版产物（含登录态，绝不入库）
+净影-PC-*.zip
+净影-便携版-*/
+build_sha.txt
+VERSION.txt

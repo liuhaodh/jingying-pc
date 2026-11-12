@@ -1,4 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 from PyInstaller.utils.hooks import collect_all
 
 datas = [('resolver.js', '.'), ('README.md', '.')]
@@ -23,6 +24,13 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
+# Windows 版本资源：由 build_release.py 按 config.APP_VERSION 生成，
+# 让 exe 右键属性的 FileVersion / ProductVersion 不再为空。纯 ASCII 内容，
+# 避免 PyInstaller 用 Windows 默认编码读取中文时乱码。
+_spec_dir = globals().get('SPECPATH') or os.getcwd()
+_version_info = os.path.join(_spec_dir, 'file_version_info.txt')
+_version_kwargs = {'version': _version_info} if os.path.isfile(_version_info) else {}
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -41,6 +49,7 @@ exe = EXE(
     entitlements_file=None,
     icon=['app.ico'],
     manifest='app.manifest',
+    **_version_kwargs,
 )
 coll = COLLECT(
     exe,

@@ -76,7 +76,7 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, PlayerMixin, QWidget):
         app = QApplication.instance()
         if app is not None:
             _apply_tooltip_theme(app)
-        self.setWindowTitle(f"{config.APP_NAME} · 电脑版 v{config.APP_VERSION}")
+        self.setWindowTitle(config.window_title())
         # 三块列表搬到独立窗口后，主界面只剩解析和 WebDAV，高度可以矮一些
         self.resize(900, 820)
         self.setMinimumWidth(860)
@@ -2444,6 +2444,7 @@ def main():
     _setup_logging()
     import logging
     logging.info("startup: args=%s", sys.argv)
+    logging.info("version=%s build=%s", config.APP_VERSION, config.build_sha() or "dev")
     logging.info("chrome=%s data=%s", config.CHROME_PATH, config.DATA_DIR)
 
     # 多账号并发时后台线程（Playwright + 作品解析）会争用 GIL；缩短线程切换
