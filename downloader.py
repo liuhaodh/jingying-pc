@@ -2,12 +2,16 @@
 """下载器：一个作品一个文件夹，按「净影/作者名_抖音号/作品id/」保存。
 
 - 视频 / 图集图片 / 实况动图 / 背景音乐 / 文案.txt 全部放在同一个作品文件夹里；
-- 不再打 tar，也不再单独建 Music 目录；
+- 主界面「下载后打包成 tar」开关打开时，下载完把作品文件夹打成
+  `<作者目录>/<作品id>.tar` 并删除散文件；WebDAV 上传的也是这个 tar；
+- 不再单独建 Music 目录；
 - 旧版 `downloads/Videos/<作者>/<作品id>.tar` 与更早的散文件目录仍能识别、能播放。
 """
 import logging
 import os
 import re
+import shutil
+import tarfile
 import threading
 import time
 import urllib.parse
@@ -357,7 +361,7 @@ def _write_caption(info, directory: str, timestamp: int) -> str:
 def download_work(info, author_folder: str, work_folder: str,
                   progress: Optional[ProgressCallback] = None,
                   cancel_event: Optional[threading.Event] = None,
-                  byte_callback=None) -> DownloadResult:
+                  byte_callback=None, pack_tar: bool = False) -> DownloadResult:
     r"""下载一个作品（视频/图集 + 背景音乐），存进一个按作品 id 命名的文件夹。
 
     2026-11-09 起的保存结构：
@@ -365,7 +369,9 @@ def download_work(info, author_folder: str, work_folder: str,
         <下载根>\净影\<作者名_抖音号>\<作品id>\
                 视频.mp4 · 图片_01.jpg · 动图_01.mp4 · 音乐.mp3 · 文案.txt
 
-    不再打 tar，也不再单独建 Music 目录：作品的全部文件都在自己的文件夹里。
+    默认保留作品文件夹；`pack_tar=True` 时（主界面开关打开）在下载线程里
+    把文件夹打成 `<作者目录>/<作品id>.tar`，删除散文件，历史记录/播放器指向
+    这个 tar。打包失败会保留文件夹并记日志，不影响已下载内容。
     """
     result = DownloadResult()
     timestamp = int(getattr(info, "create_time", 0) or 0)
@@ -453,4 +459,40 @@ def download_work(info, author_folder: str, work_folder: str,
     result.caption_path = _write_caption(info, video_dir, timestamp)
     result.archive_path = ""
     result.archive_members = []
+    if pack_tar:
+        _pack_work_result(result, directory, info)
     return result
+
+
+def _pack_work_result(result: DownloadResult, directory: str, info) -> None:
+    """把作品文件夹打成 tar，并把结果路径改写成 tar（播放器按需解包）。
+
+    只有 tar 写成功、且成员非空才删除散文件；打包失败保留原目录，
+    用户至少还能拿到已下载的视频/图片。
+    """
+    parent = os.path.dirname(directory)
+    tar_path = os.path.join(parent, archive_filename(info, os.path.basename(directory)))
+    try:
+        archive.pack(directory, tar_path)
+        members = archive.member_names(tar_path)
+        if not members:
+            raise OSError("归档包为空")
+    except (OSError, tarfile.TarError) as exc:
+        logging.warning("pack work failed, keep folder %s: %s", directory, exc)
+        try:
+            os.remove(tar_path)
+        except OSError:
+            pass
+        return
+    result.archive_path = tar_path
+    result.archive_members = members
+    # 历史记录与播放器只认 video_path / album_paths：这里统一指向 tar，
+    # 播放时由 archive.extract() 解到缓存目录（见 player.py）。
+    result.video_path = tar_path
+    if result.album_paths:
+        result.album_paths = [tar_path]
+    result.live_paths = []
+    result.music_path = ""
+    result.caption_path = ""
+    # tar 已完整落盘，散文件目录可以删了；删除失败也不影响播放。
+    shutil.rmtree(directory, ignore_errors=True)

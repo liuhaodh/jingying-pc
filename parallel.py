@@ -18,9 +18,12 @@ class DownloadManager(QObject):
     item_progress = Signal(int, int)     # job index, 当前文件百分比
     all_done = Signal(int, int)          # success, fail
 
-    def __init__(self, max_workers: int = 3):
+    def __init__(self, max_workers: int = 3, pack_tar: bool = False):
         super().__init__()
         self.max_workers = max(1, min(8, int(max_workers)))
+        # 主界面「下载后打包成 tar」开关：每个任务提交时读当前值，
+        # 运行中切换只影响之后开始的下载。
+        self.pack_tar = bool(pack_tar)
         self._executor = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -123,6 +126,7 @@ class DownloadManager(QObject):
                     info, author_folder, work_folder,
                     cancel_event=stop_event,
                     byte_callback=self._byte_callback,
+                    pack_tar=self.pack_tar,
                     progress=lambda pct, idx, total: self._emit_progress(
                         index, pct, idx, total, generation))
                 self._finish_one(True, index, result, "", generation)

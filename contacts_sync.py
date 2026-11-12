@@ -566,15 +566,17 @@ class ContactsSyncMixin:
                         return True
         except OSError:
             pass
-        # 2) 2026-11-08 的 tar
-        tar_path = os.path.join(
-            config.DOWNLOAD_BASE, author_folder,
-            downloader.archive_filename(work, folder_name))
-        try:
-            if os.path.isfile(tar_path) and os.path.getsize(tar_path) > 0:
-                return True
-        except OSError:
-            pass
+        # 2) tar：主界面「下载后打包成 tar」放在 SAVE_ROOT/作者/ 下，
+        #    2026-11-08 那批旧包在 DOWNLOAD_BASE/作者/ 下，两处都要认。
+        for base in (config.SAVE_ROOT, config.DOWNLOAD_BASE):
+            tar_path = os.path.join(
+                base, author_folder,
+                downloader.archive_filename(work, folder_name))
+            try:
+                if os.path.isfile(tar_path) and os.path.getsize(tar_path) > 0:
+                    return True
+            except OSError:
+                pass
         # 3) 更早的散文件目录
         folder = os.path.join(config.DOWNLOAD_BASE, author_folder, folder_name)
         try:

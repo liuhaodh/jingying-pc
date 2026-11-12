@@ -35,7 +35,7 @@ def _work(index):
 
 
 def _fake_download(info, author_folder, work_folder, progress=None, cancel_event=None,
-                   byte_callback=None):
+                   byte_callback=None, pack_tar=False):
     result = downloader.DownloadResult()
     # 必须和 downloader.work_dir 的真实实现一致：2026-11-09 起作品目录用
     # 作品 id 命名，而不是 build_work_folder() 传进来的「作者_文案_时间」。

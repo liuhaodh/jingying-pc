@@ -568,11 +568,17 @@ class WebdavMixin:
         uploader = self._auto_uploader
         if uploader is None:
             return
+        # 「下载后打包成 tar」开启时，磁盘上只剩 <作品id>.tar：云端也只传这个包，
+        # 否则会按散文件路径去传一堆已经不存在的文件。
+        archive_path = getattr(result, "archive_path", "")
+        if archive_path:
+            self._queue_auto_upload_paths([archive_path])
+            return
         paths = [result.video_path, result.music_path, result.caption_path]
         paths += list(result.album_paths)
         paths += list(getattr(result, "live_paths", []))
-        # 2026-11-09 起一个作品一个文件夹，archive_path 恒为空（老 tar 结构已废弃），
-        # 不用再把不存在的归档路径塞进队列。
+        # 2026-11-09 起默认一个作品一个文件夹，archive_path 为空；开关打开时
+        # 才在下载线程里打包，上面已经按 tar 单文件入队。
         self._queue_auto_upload_paths(paths)
 
     def _queue_auto_upload_paths(self, paths):

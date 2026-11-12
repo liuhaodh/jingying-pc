@@ -138,7 +138,8 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, PlayerMixin, QWidget):
         self._sync_account_label = ""
         self._last_sync_first = ""
         self._load_login_state()
-        self.dm = parallel.DownloadManager(self._dl_threads)
+        self.dm = parallel.DownloadManager(
+            self._dl_threads, pack_tar=bool(self._settings.get("pack_tar", False)))
         self.dm.item_done.connect(self._dl_item_done)
         self.dm.item_error.connect(self._dl_item_error)
         self.dm.item_started.connect(self._dl_item_started)
@@ -656,6 +657,14 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, PlayerMixin, QWidget):
         self.status.setText(f"{'下载' if kind == 'download' else '上传'}线程已设为 {count}，"
                             "下一次任务生效")
 
+    def _set_pack_tar(self, checked):
+        """「下载后打包成 tar」开关：立即持久化并同步给下载线程。"""
+        enabled = bool(checked)
+        self._settings["pack_tar"] = enabled
+        self._save_settings()
+        if getattr(self, "dm", None) is not None:
+            self.dm.pack_tar = enabled
+
     def _sync_thread_combos(self):
         for combo, value in ((self.transfer_dl_combo, self._dl_threads),
                              (self.transfer_up_combo, self._up_threads)):
@@ -1088,6 +1097,23 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, PlayerMixin, QWidget):
         self.webdav_status.setWordWrap(True)
         self.webdav_status.setStyleSheet("color:#6b7280;font-size:11px;")
         wl.addWidget(self.webdav_status)
+        pack_row = QHBoxLayout()
+        pack_row.setSpacing(8)
+        self.pack_tar_cb = QCheckBox("下载完成后打包成 tar（WebDAV 也上传 tar）")
+        self.pack_tar_cb.setChecked(bool(self._settings.get("pack_tar", False)))
+        self.pack_tar_cb.setToolTip(
+            "选中后每个作品下载完打成一个 <作品id>.tar 并删除散文件，\n"
+            "WebDAV 也只上传这个 tar。作品仍可在播放器里观看（按需解包）。")
+        self.pack_tar_cb.setStyleSheet("font-size:11px;color:#4b5563;")
+        self.pack_tar_cb.toggled.connect(self._set_pack_tar)
+        pack_row.addWidget(self.pack_tar_cb)
+        # 用户要求：开关后面直接跟一句代价提示，避免只看到「省空间」就勾上。
+        self.pack_tar_hint = QLabel("可能会影响播放性能")
+        self.pack_tar_hint.setStyleSheet("color:#b45309;font-size:11px;")
+        self.pack_tar_hint.setToolTip("播放 tar 里的作品时先解包到临时目录，首次打开会稍慢")
+        pack_row.addWidget(self.pack_tar_hint)
+        pack_row.addStretch(1)
+        wl.addLayout(pack_row)
         self.webdav_skip_cb = QCheckBox("跳过已上传（只传新增或变化的文件）")
         self.webdav_skip_cb.setChecked(True)
         self.webdav_skip_cb.setStyleSheet("font-size:11px;color:#4b5563;")

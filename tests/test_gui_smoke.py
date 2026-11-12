@@ -55,6 +55,20 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertIn(f"v{config.APP_VERSION}", self.window.windowTitle())
         self.assertEqual(self.window.download_panel.progress.value(), 0)
         self.assertEqual(self.window.upload_panel.progress.value(), 0)
+        # 「下载后打包成 tar」开关：默认关闭（保持作品文件夹），后面带性能提示
+        self.assertIsNotNone(self.window.pack_tar_cb)
+        self.assertFalse(self.window.pack_tar_cb.isChecked())
+        self.assertIn("可能会影响播放性能", self.window.pack_tar_hint.text())
+
+    def test_pack_tar_toggle(self):
+        """勾选后立即持久化，并同步给下载线程；再取消能恢复。"""
+        self.assertFalse(self.window.dm.pack_tar)
+        self.window.pack_tar_cb.setChecked(True)
+        self.assertTrue(self.window._settings.get("pack_tar"))
+        self.assertTrue(self.window.dm.pack_tar)
+        self.window.pack_tar_cb.setChecked(False)
+        self.assertFalse(self.window._settings.get("pack_tar"))
+        self.assertFalse(self.window.dm.pack_tar)
 
     def test_sync_log_window(self):
         """「查看日志」只显示账号 / 作者 / 作品数。"""
