@@ -486,8 +486,8 @@ def _pack_work_result(result: DownloadResult, directory: str, info) -> None:
         return
     result.archive_path = tar_path
     result.archive_members = members
-    # 历史记录与播放器只认 video_path / album_paths：这里统一指向 tar，
-    # 播放时由 archive.extract() 解到缓存目录（见 player.py）。
+    # 历史记录与上传队列只认 video_path / album_paths：这里统一指向 tar。
+    # tar 不能直接播放，用系统播放器打开前需要先解包（archive.extract）。
     result.video_path = tar_path
     if result.album_paths:
         result.album_paths = [tar_path]
