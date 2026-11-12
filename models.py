@@ -17,6 +17,7 @@ class MediaInfo:
         self.music_title = ""
         self.share_url = ""
         self.quality = ""
+        self.size = 0
         self.duration_ms = 0
         self.width = 0
         self.height = 0
@@ -286,6 +287,9 @@ def _select_video(video: dict, info: MediaInfo):
         info.quality = _quality_label(best)
         info.width = best["width"]
         info.height = best["height"]
+        # 记下这一档的字节数：同步时拿它和云端文件大小做粗筛，避免为每个
+        # 老作品都发一次远端请求去读分辨率。
+        info.size = best["size"]
         return
     # 一个可选流都没有（字段缺失）：退回老办法，至少拿到能播的地址
     info.play_url = _clean_url(_first_url(video.get("play_addr"))) or \

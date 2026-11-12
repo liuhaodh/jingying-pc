@@ -251,5 +251,77 @@ class UploadProgressTests(unittest.TestCase):
         self.assertEqual(sum(seen), len(data))
 
 
+class _FakeResponse:
+    """只实现 WebDAVClient 读取时会碰到的 requests.Response 接口。"""
+
+    def __init__(self, status=200, headers=None, body=b"", text=""):
+        self.status_code = status
+        self.headers = headers or {}
+        self.content = body
+        self.text = text
+        self._body = body
+        self.read_bytes = 0
+        self.closed = False
+
+    def iter_content(self, chunk_size):
+        for offset in range(0, len(self._body), chunk_size):
+            part = self._body[offset:offset + chunk_size]
+            self.read_bytes += len(part)
+            yield part
+
+    def close(self):
+        self.closed = True
+
+
+class RemoteReadTests(unittest.TestCase):
+    """云端画质核对用到的只读接口：stat / fetch_range。"""
+
+    def setUp(self):
+        self.client = webdav.WebDAVClient("http://example.invalid/dav")
+
+    def test_stat_falls_back_to_propfind_without_content_length(self):
+        head = _FakeResponse(200, {})
+        propfind = _FakeResponse(
+            207, text="<D:multistatus xmlns:D='DAV:'>"
+                      "<D:getcontentlength>4096</D:getcontentlength>"
+                      "</D:multistatus>")
+        with mock.patch.object(self.client, "_request",
+                               side_effect=[head, propfind]) as request:
+            self.assertEqual(self.client.stat("净影/a/视频.mp4"), (True, 4096))
+        self.assertEqual([call[0][0] for call in request.call_args_list],
+                         ["HEAD", "PROPFIND"])
+
+    def test_stat_head_confirms_existence_even_if_propfind_404(self):
+        head = _FakeResponse(200, {})
+        propfind = _FakeResponse(404)
+        with mock.patch.object(self.client, "_request", side_effect=[head, propfind]):
+            self.assertEqual(self.client.stat("净影/a/视频.mp4"), (True, 0))
+
+    def test_fetch_range_returns_206_body(self):
+        response = _FakeResponse(206, body=b"hello")
+        with mock.patch.object(self.client, "_request", return_value=response):
+            self.assertEqual(self.client.fetch_range("a.mp4", 0, 4), b"hello")
+        self.assertTrue(response.closed)
+
+    def test_fetch_range_without_range_support_reads_only_needed_bytes(self):
+        """服务器忽略 Range 时，只取到 end 就断开，不把整份视频吃进内存。"""
+        body = bytes(range(256)) * 4096          # 1 MB
+        response = _FakeResponse(200, body=body)
+        with mock.patch.object(self.client, "_request",
+                               return_value=response) as request:
+            data = self.client.fetch_range("a.mp4", 100, 200)
+        self.assertEqual(data, body[100:201])
+        self.assertLessEqual(response.read_bytes, 256 * 1024)
+        self.assertTrue(response.closed)
+        self.assertTrue(request.call_args.kwargs.get("stream"))
+
+    def test_fetch_range_rejects_huge_non_range_response(self):
+        response = _FakeResponse(200, body=b"x" * 1024)
+        with mock.patch.object(self.client, "_request", return_value=response):
+            with self.assertRaises(webdav.WebDAVError):
+                self.client.fetch_range("a.mp4", 0, 40 * 1024 * 1024)
+        self.assertEqual(response.read_bytes, 0, "超限时应直接拒绝，不下载")
+
+
 if __name__ == "__main__":
     unittest.main()

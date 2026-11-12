@@ -157,11 +157,15 @@ class GuiFlowTests(unittest.TestCase):
         def fake_resolve(sec_uid, stage=None, **kwargs):
             return profile
 
+        # 上一轮遗留的「云端已是高画质」跳过数不能带进新一轮
+        self.window._dl_skip = 7
         with mock.patch.object(parser, "resolve_profile", side_effect=fake_resolve):
             self.window._sync_all()
             self.assertTrue(self.window.syncing)
             self.assertTrue(self._wait(lambda: not self.window.syncing, timeout=20))
 
+        self.assertEqual(self.window._dl_skip, 0)
+        self.assertNotIn("高画质跳过", self.window.contact_status.text())
         self.assertEqual(len(self.window.store.load_history()), 2)
         self.assertIn("全部同步完成", self.window.contact_status.text())
         self.assertEqual(self.window._sync_total_new, 2)

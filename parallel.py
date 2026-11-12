@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """多线程下载管理器：多个作品并行下载。"""
+import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -14,16 +15,25 @@ class DownloadManager(QObject):
 
     item_done = Signal(int, object)      # job index, DownloadResult
     item_error = Signal(int, str)        # job index, error message
+    item_skipped = Signal(int, str)      # job index, 跳过原因（云端已是最优画质等）
     item_started = Signal(int)           # job index
     item_progress = Signal(int, int)     # job index, 当前文件百分比
     all_done = Signal(int, int)          # success, fail
 
-    def __init__(self, max_workers: int = 3, pack_tar: bool = False):
+    def __init__(self, max_workers: int = 3, pack_tar: bool = False,
+                 precheck=None):
         super().__init__()
         self.max_workers = max(1, min(8, int(max_workers)))
         # 主界面「下载后打包成 tar」开关：每个任务提交时读当前值，
         # 运行中切换只影响之后开始的下载。
         self.pack_tar = bool(pack_tar)
+        # 下载前的可选预检：`precheck(info, author_folder, work_folder)`
+        # 返回非空字符串表示「不用下载」，字符串是给界面看的原因。
+        # 挂在下载线程里调用，网络请求不会卡主线程。
+        self.precheck = precheck
+        # 只有这些作品需要预检（云端已有备份、可能要按分辨率重下的那些）。
+        # 单次 membership 判断，多线程并发读一个 set 是安全的。
+        self.upgrade_ids = set()
         self._executor = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -52,6 +62,8 @@ class DownloadManager(QObject):
         self._fail = 0
         self._last_progress = {}
         self._last_progress_time = {}
+        # 预检名单只对当前这一轮有效，否则上一轮的作品会被白白探测一遍
+        self.upgrade_ids.clear()
         with self._lock:
             self._generation += 1
         self._executor = ThreadPoolExecutor(
@@ -117,6 +129,19 @@ class DownloadManager(QObject):
             return
         last_error = None
         self.item_started.emit(index)
+        # 「云端已有但可能是低画质」的作品：下载前先核对远端分辨率。
+        # 达标就整单跳过，省掉一次几十 MB 的下载；低于解析结果才继续。
+        if self.precheck is not None and info.aweme_id in self.upgrade_ids:
+            try:
+                reason = self.precheck(info, author_folder, work_folder)
+            except Exception as exc:  # noqa: BLE001 - 预检失败按正常下载处理
+                logging.warning("cloud quality precheck failed aweme=%s: %s",
+                                info.aweme_id, exc)
+                reason = ""
+            if reason:
+                self._finish_one(False, index, None, reason, generation,
+                                 skipped=True)
+                return
         for attempt in range(2):
             if stop_event.is_set():
                 self._finish_one(False, index, None, "已取消", generation)
@@ -140,7 +165,8 @@ class DownloadManager(QObject):
                     time.sleep(1.0)
         self._finish_one(False, index, None, str(last_error) or "下载失败", generation)
 
-    def _finish_one(self, ok, index, result, error, generation=None):
+    def _finish_one(self, ok, index, result, error, generation=None,
+                    skipped=False):
         if generation is not None and self._stale(generation):
             # 上一轮遗留任务：结果整体作废，不能改计数、也不能发信号。
             return
@@ -148,11 +174,14 @@ class DownloadManager(QObject):
             self._remaining -= 1
             if ok:
                 self._success += 1
-            else:
+            elif not skipped:
                 self._fail += 1
             last = self._remaining <= 0
         if ok:
             self.item_done.emit(index, result)
+        elif skipped:
+            # 跳过不是失败：不计入失败数，也不写历史，界面单独显示原因。
+            self.item_skipped.emit(index, error or "已跳过")
         else:
             self.item_error.emit(index, error)
         if last:

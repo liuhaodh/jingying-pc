@@ -2,6 +2,7 @@
 """WebDAV 上传：保持本地 downloads 下的原目录结构，支持并行上传与增量跳过。"""
 import logging
 import os
+import re
 import threading
 import time
 import urllib.parse
@@ -308,6 +309,92 @@ class WebDAVClient:
                     if key == parent or parent.startswith(key + "/"):
                         self._dir_failures.pop(key, None)
         raise last
+
+    # ---------- 读取（用于核对云端已有文件的画质） ----------
+    def stat(self, rel_path):
+        """返回 (是否存在, 字节数)。优先 HEAD，服务端不支持时退回 PROPFIND。"""
+        rel_path = rel_path.replace("\\", "/").strip("/")
+        # HEAD 只回头部，比 PROPFIND 的 XML 便宜；个别 WebDAV 网关不支持 HEAD，
+        # 会回 405/501/403，这时再走 PROPFIND。
+        response = self._request("HEAD", rel_path)
+        head_ok = response.status_code in (200, 204)
+        if head_ok:
+            length = response.headers.get("Content-Length")
+            try:
+                size = int(length) if length is not None else 0
+            except (TypeError, ValueError):
+                size = 0
+            if size > 0:
+                return (True, size)
+            # HEAD 没带 Content-Length（部分网关会这样）：继续用 PROPFIND
+            # 取 getcontentlength，别把「读不到大小」当成「读不到画质」。
+        if response.status_code in (404, 410):
+            return (False, 0)
+        response = self._request("PROPFIND", rel_path, headers={"Depth": "0"})
+        if response.status_code == 404:
+            return (head_ok, 0)
+        if response.status_code not in (200, 207):
+            detail = (response.text or "")[:120].replace("\n", " ")
+            raise WebDAVError(
+                f"读取远端文件信息失败 {rel_path}: HTTP {response.status_code} {detail}")
+        text = response.text or ""
+        # 命名空间前缀不固定（d: / D: / lp1:），统一按「标签名结尾」匹配
+        match = re.search(
+            r"<(?:[\w.-]+:)?getcontentlength[^>]*>\s*(\d+)\s*<", text, re.I)
+        return (True, int(match.group(1)) if match else 0)
+
+    def fetch_range(self, rel_path, start, end):
+        """按字节区间读取（闭区间），用于只取 MP4 的 moov/tkhd。"""
+        start, end = max(0, int(start)), max(0, int(end))
+        headers = {"Range": f"bytes={start}-{end}"}
+        # stream=True：服务器不支持 Range 而回整个文件时，只读到 end 就断开，
+        # 不会先把几百 MB 的视频整个吃进内存再切一小块。
+        response = self._request("GET", rel_path, headers=headers, stream=True)
+        try:
+            if response.status_code == 206:
+                return response.content or b""
+            if response.status_code in (200, 203):
+                limit = 32 * 1024 * 1024
+                if end + 1 > limit:
+                    raise WebDAVError(
+                        f"服务器不支持 Range，且所需区间超过 {limit} 字节：{rel_path}")
+                chunks = []
+                remaining = end + 1
+                for chunk in response.iter_content(256 * 1024):
+                    if not chunk:
+                        continue
+                    take = chunk[:remaining]
+                    chunks.append(take)
+                    remaining -= len(take)
+                    if remaining <= 0:
+                        break
+                return b"".join(chunks)[start:end + 1]
+            if response.status_code == 404:
+                raise WebDAVError(f"远端文件不存在：{rel_path}")
+            raise WebDAVError(
+                f"读取远端文件失败 {rel_path}: HTTP {response.status_code}")
+        finally:
+            try:
+                response.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def download_to(self, rel_path, target_path):
+        """把远端文件流式下载到本地路径（tar 包探测画质时用）。"""
+        response = self._request("GET", rel_path, stream=True)
+        try:
+            if response.status_code not in (200, 206):
+                raise WebDAVError(
+                    f"下载远端文件失败 {rel_path}: HTTP {response.status_code}")
+            with open(target_path, "wb") as handle:
+                for chunk in response.iter_content(256 * 1024):
+                    if chunk:
+                        handle.write(chunk)
+        finally:
+            try:
+                response.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def test(self):
         """测试连接，并确认远程根目录真的可写。"""

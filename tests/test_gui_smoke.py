@@ -70,6 +70,59 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertFalse(self.window._settings.get("pack_tar"))
         self.assertFalse(self.window.dm.pack_tar)
 
+    def test_cloud_upgrade_switch_defaults_off(self):
+        """新开关默认关、提示写清前置条件；没配 WebDAV 时不能勾。"""
+        cb = self.window.webdav_upgrade_cb
+        self.assertIsNotNone(cb)
+        self.assertFalse(cb.isChecked())
+        self.assertFalse(self.window._cloud_upgrade_flag)
+        self.assertIn("只取几 KB", cb.toolTip())
+        self.assertIn("自动上传新文件", cb.toolTip())
+        self.assertFalse(cb.isEnabled(), "未配置 WebDAV 时开关应置灰")
+
+    def test_cloud_upgrade_switch_persists_and_syncs_thread_flag(self):
+        """下载线程读的是 bool 快照，勾选/取消都要立刻同步并持久化。"""
+        cb = self.window.webdav_upgrade_cb
+        cb.setEnabled(True)
+        cb.setChecked(True)
+        self.assertTrue(self.window._settings.get("webdav_upgrade_low_quality"))
+        self.assertTrue(self.window._cloud_upgrade_flag)
+        cb.setChecked(False)
+        self.assertFalse(self.window._settings.get("webdav_upgrade_low_quality"))
+        self.assertFalse(self.window._cloud_upgrade_flag)
+
+    def test_auto_upload_toggle_syncs_thread_flag(self):
+        self.assertTrue(self.window._auto_upload_flag)
+        self.window.webdav_auto_cb.setEnabled(True)
+        self.window.webdav_auto_cb.setChecked(False)
+        self.assertFalse(self.window._auto_upload_flag)
+        self.assertFalse(self.window._settings.get("webdav_auto_upload"))
+        self.window.webdav_auto_cb.setChecked(True)
+        self.assertTrue(self.window._auto_upload_flag)
+
+    def test_saving_webdav_config_drops_stale_probe_client(self):
+        """换服务器后必须释放旧连接池与路径索引，否则会拿旧服务器的画质判断。"""
+        events = []
+
+        class _Probe:
+            def save(self, force=False):
+                events.append(("save", force))
+
+        class _Client:
+            def close(self):
+                events.append(("close",))
+
+        self.window._probe_obj = _Probe()
+        self.window._probe_client_obj = _Client()
+        self.window._remote_unit_index_cache = (("stale",), {})
+        self.window._save_webdav_config(
+            {"url": "https://dav.example.com", "remote_root": "净影"})
+        self.assertIsNone(self.window._probe_obj)
+        self.assertIsNone(self.window._probe_client_obj)
+        self.assertIsNone(self.window._remote_unit_index_cache)
+        self.assertIn(("save", True), events)
+        self.assertIn(("close",), events)
+
     def test_sync_log_window(self):
         """「查看日志」只显示账号 / 作者 / 作品数。"""
         import sync_log

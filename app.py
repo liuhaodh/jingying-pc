@@ -100,6 +100,8 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
         self._upload_bridge = None
         self._upload_counts = {"ok": 0, "skipped": 0, "failed": 0}
         self._webdav_state_lock = threading.Lock()
+        # 远端画质探测：连接池与缓存都要跨下载线程串行访问
+        self._probe_lock = threading.Lock()
         self._upload_root = ""
         self._workers = []
         self._avatar_cache = {}
@@ -135,10 +137,19 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
         self._sync_account_label = ""
         self._last_sync_first = ""
         self._load_login_state()
+        # 下载线程不能读 QWidget：开关状态统一由主线程写进这两个 bool 快照。
+        # 默认值要在这里就位，早于 UI 构建（同步可能比窗口更早跑起来）。
+        self._cloud_upgrade_flag = bool(
+            self._settings.get("webdav_upgrade_low_quality", False))
+        self._auto_upload_flag = bool(
+            self._settings.get("webdav_auto_upload", True))
+        self._upgrade_delete_paths = set()
         self.dm = parallel.DownloadManager(
-            self._dl_threads, pack_tar=bool(self._settings.get("pack_tar", False)))
+            self._dl_threads, pack_tar=bool(self._settings.get("pack_tar", False)),
+            precheck=self._cloud_quality_precheck)
         self.dm.item_done.connect(self._dl_item_done)
         self.dm.item_error.connect(self._dl_item_error)
+        self.dm.item_skipped.connect(self._dl_item_skipped)
         self.dm.item_started.connect(self._dl_item_started)
         self.dm.item_progress.connect(self._dl_item_progress)
         self._dl_mode = None
@@ -150,6 +161,7 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
         self._dl_total = 0
         self._dl_success = 0
         self._dl_fail = 0
+        self._dl_skip = 0
         self._dl_author = None
         self._sync_queue = []
         self._sync_index = 0
@@ -803,7 +815,49 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
                 f"{self._sync_prefix(author)}；已抓取 {fetched}/"
                 f"{len(self._sync_queue)} 位作者，下载完成 "
                 f"{self._dl_done}/{self._dl_total}")
+        if work.aweme_id in self.dm.upgrade_ids:
+            # 这是「云端低画质重下」：上传成功后要把这份本地副本删掉
+            self._queue_upgrade_delete(result)
+            self.dm.upgrade_ids.discard(work.aweme_id)
         self._queue_auto_upload(result)
+        self._maybe_finish_downloads()
+
+    def _dl_item_skipped(self, index, reason=""):
+        """下载前预检判定「云端画质已经够好」：不下载、不写历史、不算失败。"""
+        if self._dl_mode is None:
+            return
+        job = self._dl_job(index)
+        if job is None:
+            return
+        work = job[0]
+        self._dl_progress.pop(index, None)
+        import logging
+        logging.info("skip download aweme=%s: %s", work.aweme_id, reason)
+        self.dm.upgrade_ids.discard(work.aweme_id)
+        note = (reason or "已跳过")[:24]
+        key = self._dl_key(index)
+        self._transfer_update(key, "跳过：" + (reason or "")[:48])
+        self.download_panel.set_item_progress(key, 100)
+        self._dl_done += 1
+        self._dl_skip += 1
+        if self._dl_mode == "batch":
+            self.batch_progress.setValue(int(self._dl_done * 100 / max(1, self._dl_total)))
+            self.batch_status.setText(
+                f"并发下载中：完成 {self._dl_done}/{self._dl_total}（跳过：{note}）")
+        else:
+            author = (self._dl_authors[index]
+                      if index < len(self._dl_authors) else self._dl_author)
+            if author is not None:
+                pending = getattr(self, "_sync_author_remaining", {}).get(
+                    author.sec_uid)
+                if pending is not None:
+                    self._sync_author_remaining[author.sec_uid] = max(0, pending - 1)
+            fetched = min(self._sync_index, len(self._sync_queue))
+            self.contact_status.setText(
+                f"{self._sync_prefix(author)}；已抓取 {fetched}/"
+                f"{len(self._sync_queue)} 位作者，下载完成 "
+                f"{self._dl_done}/{self._dl_total}"
+                f"（跳过 {self._dl_skip} 个，最近：{note}）")
         self._maybe_finish_downloads()
 
     def _dl_item_error(self, index, message):
@@ -857,7 +911,8 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
             self.batch_download_btn.setText("再次下载")
             self.parse_btn.setEnabled(True)
             self.batch_status.setText(
-                f"下载完成：成功 {self._dl_success}，失败 {self._dl_fail}")
+                f"下载完成：成功 {self._dl_success}，失败 {self._dl_fail}"
+                + (f"，跳过 {self._dl_skip}" if self._dl_skip else ""))
             self._render_history()
 
     def _build_ui(self):
@@ -1130,6 +1185,19 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
         self.webdav_delete_cb.setStyleSheet("font-size:11px;color:#b45309;")
         self.webdav_delete_cb.toggled.connect(self._set_delete_after_upload)
         wl.addWidget(self.webdav_delete_cb)
+        # 「云端低画质自动重下」：默认关闭。勾选后同步时先读 WebDAV 上已有文件的
+        # 实际分辨率，确实低于本次解析结果才重下，避免把整个库白下一遍。
+        self.webdav_upgrade_cb = QCheckBox(
+            "云端已有低画质时自动重下（上传后删除本地副本）")
+        self.webdav_upgrade_cb.setChecked(
+            bool(self._settings.get("webdav_upgrade_low_quality", False)))
+        self.webdav_upgrade_cb.setToolTip(
+            "同步时先读取 WebDAV 上已有作品的真实分辨率（只取几 KB 文件头）：\n"
+            "低于本次解析结果才重新下载，下载后覆盖上传，上传成功再删掉本地副本。\n"
+            "需要同时开启「通讯录同步时自动上传新文件」，否则不会自动上传和清理。")
+        self.webdav_upgrade_cb.setStyleSheet("font-size:11px;color:#b45309;")
+        self.webdav_upgrade_cb.toggled.connect(self._set_cloud_upgrade)
+        wl.addWidget(self.webdav_upgrade_cb)
         self._refresh_webdav_status(lazy=True)
         content.addWidget(self.webdav_card)
 
@@ -1770,6 +1838,7 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
         self._dl_total = len(jobs)
         self._dl_success = 0
         self._dl_fail = 0
+        self._dl_skip = 0
         self.batch_progress.setValue(0)
         self.batch_download_btn.setEnabled(False)
         self.batch_status.setText(
@@ -2216,6 +2285,11 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
                     pass
         try:
             self.dm.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        # 远端画质探测用的连接池：关窗时一并释放，并把缓存落盘
+        try:
+            self._close_probe_client()
         except Exception:  # noqa: BLE001
             pass
         if getattr(self, "_auto_uploader", None) is not None:

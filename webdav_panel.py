@@ -18,6 +18,9 @@ from PySide6.QtWidgets import (
 
 import auto_upload
 import config
+import downloader
+import media_probe
+import remote_quality
 import webdav
 from workers import Worker
 
@@ -107,6 +110,9 @@ class WebdavMixin:
             # 任务被中断、关窗或中途失败就一个文件都不删，表现就是「上传完
             # 了本地还在」。随文件删还有个好处：删完马上腾出磁盘空间。
             self._delete_after_upload(rel)
+            # 「云端低画质重下」产生的副本：确认这次上传成功后再删，不受
+            # 全局「上传后删除本地媒体」开关影响。
+            self._delete_upgraded_local(rel)
         counts = self._upload_counts
         key = {"done": "ok", "skipped": "skipped", "failed": "failed"}.get(status)
         if key:
@@ -158,6 +164,235 @@ class WebdavMixin:
             return
         self._delete_uploaded_media(rel)
 
+    # ---------- 云端画质核对（低画质自动重下） ----------
+    def _cloud_upgrade_enabled(self):
+        """开关状态快照。下载线程不能读 QWidget，统一读主线程写下的 bool。"""
+        return bool(getattr(self, "_cloud_upgrade_flag", False))
+
+    def _auto_upload_enabled(self):
+        return bool(getattr(self, "_auto_upload_flag", False))
+
+    def _probe_client(self):
+        """懒加载一个用于读远端文件的客户端 + 探测缓存（跨线程用锁）。"""
+        lock = getattr(self, "_probe_lock", None)
+        if lock is None:
+            lock = self._probe_lock = threading.Lock()
+        with lock:
+            probe = getattr(self, "_probe_obj", None)
+            if probe is not None:
+                return probe
+            cfg = getattr(self, "_webdav", {}) or {}
+            if not cfg.get("url"):
+                return None
+            try:
+                client = webdav.WebDAVClient(
+                    cfg.get("url", ""), cfg.get("username", ""),
+                    cfg.get("password", ""), cfg.get("remote_root", ""),
+                    verify=cfg.get("verify", True))
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("create probe client failed: %s", exc)
+                return None
+            probe = remote_quality.RemoteQualityProbe(
+                client,
+                cache_path=os.path.join(config.DATA_DIR, "remote_quality.json"),
+                tmp_dir=config.DATA_DIR,
+                namespace=f"{cfg.get('url', '')}|{cfg.get('remote_root', '')}")
+            self._probe_obj = probe
+            self._probe_client_obj = client
+            return probe
+
+    def _close_probe_client(self):
+        probe = getattr(self, "_probe_obj", None)
+        if probe is not None:
+            try:
+                probe.save(force=True)
+            except Exception:  # noqa: BLE001
+                pass
+            self._probe_obj = None
+        client = getattr(self, "_probe_client_obj", None)
+        if client is not None:
+            _close_client(client)
+            self._probe_client_obj = None
+
+    def _remote_unit_index(self):
+        """`作品单元 -> [远程相对路径]` 索引，按上传记录构建一次。
+
+        同步时每个作品都要问「云端有没有、在哪」，直接遍历几万条上传记录会
+        把主线程拖死；索引只在记录条数变化时重建。
+        """
+        files = self._load_webdav_state().get("files") or {}
+        cfg = getattr(self, "_webdav", {}) or {}
+        # key 里带上服务器配置：换服务器后新 dict 可能恰好复用旧 dict 的
+        # 内存地址，只靠 id(files) 会把上一台服务器的路径索引当成新的。
+        key = (cfg.get("url", ""), cfg.get("remote_root", ""),
+               id(files), len(files))
+        cache = getattr(self, "_remote_unit_index_cache", None)
+        if cache is not None and cache[0] == key:
+            return cache[1]
+        index = {}
+        # 上传线程会往同一个 files dict 里写新记录，而这里是从下载线程遍历的。
+        # 先取键快照（list(dict) 在 GIL 下是原子 C 调用），避免
+        # "dictionary changed size during iteration" 让预检整个失败并触发误重下。
+        for rel in list(files):
+            unit = upload_unit_of(rel)
+            if unit:
+                index.setdefault(unit, []).append(rel)
+        # 散文件排前面（Range 只取几 KB），tar 包整包下载，放最后
+        for rels in index.values():
+            rels.sort(key=lambda r: (1 if r.lower().endswith(".tar") else 0, len(r)))
+        self._remote_unit_index_cache = (key, index)
+        return index
+
+    def _remote_media_rels(self, author_folder, names):
+        """作者目录下某个作品的云端主文件候选（视频 / 首图 / tar）。"""
+        if not author_folder or not names:
+            return []
+        index = self._remote_unit_index()
+        found = []
+        # 与 _work_backed_up 用同一组顶层目录 + 同一组作品名，否则「云端有
+        # 备份」判定为真、这里却找不到文件，整库都会被当成需要重下。
+        for base in ("净影", "Videos", "Music"):
+            for name in names:
+                if not name:
+                    continue
+                for rel in index.get(f"{base}/{author_folder}/{name}") or ():
+                    if rel not in found:
+                        found.append(rel)
+        return found
+
+    def _remote_file_size(self, rel):
+        """上传记录里记的字节数；格式是 `"<size>:<mtime>"`。"""
+        value = (self._load_webdav_state().get("files") or {}).get(rel, "")
+        try:
+            return int(str(value).split(":")[0])
+        except (TypeError, ValueError):
+            return 0
+
+    def _cloud_quality_precheck(self, info, author_folder, work_folder):
+        """下载线程里的预检：云端那份够清楚就跳过，否则照常下载（覆盖重传）。
+
+        返回值是给界面看的「跳过原因」；返回空字符串表示继续下载。
+        """
+        if not self._cloud_upgrade_enabled():
+            return ""
+        if not self._auto_upload_enabled():
+            # 没有上传线程，重下之后无法覆盖云端，也就无从「上传完再删本地」
+            return "未开启自动上传，保留云端备份不重下"
+        target_w = int(getattr(info, "width", 0) or 0)
+        target_h = int(getattr(info, "height", 0) or 0)
+        if not target_w or not target_h:
+            return ""
+        if getattr(info, "is_album", lambda: False)():
+            # 图集是签名模板图，改参数只会 403，没有更高画质可下
+            return ""
+        names = [work_folder]
+        for name in (downloader.work_folder_name(info, work_folder),
+                     downloader.archive_filename(info, work_folder)):
+            if name and name not in names:
+                names.append(name)
+        rels = self._remote_media_rels(author_folder, names)
+        if not rels:
+            # 走到这里说明「云端有备份」已判定为真，却按作品名找不到主文件。
+            # 宁可保留已有备份，也不要因为索引对不上把整个库重下一遍。
+            return "云端备份路径无法定位，保留已有备份"
+        target_size = int(getattr(info, "size", 0) or 0)
+        # 先用上传记录里的字节数粗筛：同一画质重传后大小基本不变，差不到 15%
+        # 就不必再发远端请求；只有明显更小的（多半是低一档）才值得读分辨率。
+        # 这一条能把「本地已删、云端是同画质」的绝大多数老作品挡在探测之外。
+        for rel in rels:
+            cloud_size = self._remote_file_size(rel)
+            if not (target_size and cloud_size):
+                continue
+            if cloud_size >= target_size * 0.85:
+                return (f"云端文件 {cloud_size / 1048576:.1f} MB，"
+                        f"与本次解析的 {target_size / 1048576:.1f} MB 相近")
+        probe = self._probe_client()
+        if probe is None:
+            return "WebDAV 未配置或不可用，保留已有备份"
+        probed = 0
+        for rel in rels:
+            try:
+                result = probe.probe(rel)
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("probe remote quality failed %s: %s", rel, exc)
+                continue
+            if not result:
+                continue
+            probed += 1
+            remote_w, remote_h, _size = result
+            if not media_probe.should_upgrade(target_w, target_h, remote_w, remote_h):
+                # 同一作品在云端可能留了多份（散文件 + tar），只要有一份
+                # 够清楚就别重下。
+                return (f"云端已是 {remote_w}×{remote_h}，"
+                        f"不低于本次解析的 {target_w}×{target_h}")
+        if probed:
+            # 能读出的云端文件全都更低：照常下载并覆盖上传
+            logging.info("cloud quality low, re-download %s: target=%sx%s",
+                         author_folder, target_w, target_h)
+            return ""
+        # 读不出分辨率（服务器不支持 Range、编码不认识、tar 过大等）：保持
+        # 旧行为跳过，绝不能让一次探测失败把整个已备份的库重下一遍。
+        return "云端画质无法确认，保留已有备份"
+
+    def _queue_upgrade_delete(self, result):
+        """记下「这一次是低画质重下」的本地媒体，上传成功后删除。"""
+        paths = getattr(self, "_upgrade_delete_paths", None)
+        if paths is None:
+            paths = self._upgrade_delete_paths = set()
+        root = os.path.abspath(config.UPLOAD_ROOT)
+        candidates = [getattr(result, "video_path", ""),
+                      getattr(result, "music_path", "")]
+        candidates += list(getattr(result, "album_paths", []) or [])
+        candidates += list(getattr(result, "live_paths", []) or [])
+        for path in candidates:
+            if not path:
+                continue
+            try:
+                absolute = os.path.abspath(path)
+                if os.path.commonpath([root, absolute]) != root:
+                    continue
+            except ValueError:
+                continue
+            paths.add(os.path.relpath(absolute, root).replace("\\", "/"))
+        if paths:
+            logging.info("upgrade re-download queued for delete-after-upload: %d",
+                         len(paths))
+
+    def _delete_upgraded_local(self, rel):
+        """这次因低画质重下产生的本地媒体，在确认上传成功后删除。
+
+        与「上传成功后删除本地媒体」开关相互独立：那个开关是全局清理策略，
+        这里只处理本轮升级重下留下的副本，避免用户在没开全局清理时也悄悄
+        多出一份 4K 文件。只删「刚传完的那个文件」：同一作品的音乐/图片可能
+        还没传完，提前删本地会让上传线程读不到文件。
+        """
+        paths = getattr(self, "_upgrade_delete_paths", None)
+        if not paths:
+            return
+        key = str(rel or "").replace("\\", "/").strip("/")
+        if not key or key not in paths:
+            return
+        paths.discard(key)
+        if not paths:
+            self._upgrade_delete_paths = set()
+        logging.info("upgrade re-download uploaded, deleting local %s", key)
+        self._delete_uploaded_media(key)
+
+    def _set_cloud_upgrade(self, checked):
+        """「云端低画质时重下」开关：持久化，并给用户讲清代价。"""
+        enabled = bool(checked)
+        self._cloud_upgrade_flag = enabled
+        self._settings["webdav_upgrade_low_quality"] = enabled
+        self._save_settings()
+        if not enabled:
+            self.webdav_status.setText("云端低画质自动重下：已关闭")
+        elif not self._auto_upload_enabled():
+            self.webdav_status.setText(
+                "云端低画质自动重下：已开启；还需勾选「通讯录同步时自动上传新文件」")
+        else:
+            self.webdav_status.setText(
+                "云端低画质自动重下：已开启（上传成功后删除重下的本地媒体）")
+
     # ---------- 已上传单元索引（供「是否已下载」判断用） ----------
     def _uploaded_units(self):
         """云端已有备份的「作品单元」集合：作品目录（去掉文件名）或作品 tar 本身。
@@ -174,7 +409,7 @@ class WebdavMixin:
             return cache[1]
         units = set()
         files = self._load_webdav_state().get("files") or {}
-        for rel in files:
+        for rel in list(files):
             unit = upload_unit_of(rel)
             if unit:
                 units.add(unit)
@@ -292,6 +527,13 @@ class WebdavMixin:
 
     def _save_webdav_config(self, data):
         import json
+        # 服务器/账号/远程目录一变，探测用的连接与「按路径记的分辨率」就不再
+        # 可信：先释放旧连接池、强制落盘缓存，下次预检会按新配置重建。
+        try:
+            self._close_probe_client()
+        except Exception:  # noqa: BLE001
+            logging.warning("close stale probe client failed", exc_info=True)
+        self._remote_unit_index_cache = None
         self._webdav = data
         try:
             with open(self._webdav_file(), "w", encoding="utf-8") as f:
@@ -310,6 +552,9 @@ class WebdavMixin:
                     "同步下载通讯录新作品的同时，把新文件传到 WebDAV")
             else:
                 self.webdav_auto_cb.setToolTip("请先配置 WebDAV 服务器")
+        if hasattr(self, "webdav_upgrade_cb"):
+            # 没配服务器时没有云端文件可核对，开关置灰免得勾了没反应
+            self.webdav_upgrade_cb.setEnabled(bool(url))
         if url:
             root = cfg.get("remote_root", "") or "/"
             if lazy and getattr(self, "_webdav_state_cache", None) is None:
@@ -324,6 +569,8 @@ class WebdavMixin:
 
     def _set_auto_upload_enabled(self, checked):
         self._settings["webdav_auto_upload"] = bool(checked)
+        # 下载线程靠这个快照判断「重下之后能不能覆盖云端」，不能直接读控件
+        self._auto_upload_flag = bool(checked)
         self._save_settings()
         if not checked and self._auto_uploader is not None:
             old = self._auto_uploader
@@ -334,8 +581,12 @@ class WebdavMixin:
             self._auto_uploader = None
             self._upload_active = False
             old.close()
-        self.webdav_status.setText(
-            "通讯录同步时自动上传：已开启" if checked else "通讯录同步时自动上传：已关闭")
+        if checked and self._cloud_upgrade_enabled():
+            self.webdav_status.setText(
+                "通讯录同步时自动上传：已开启；云端低画质自动重下已同时生效")
+        else:
+            self.webdav_status.setText(
+                "通讯录同步时自动上传：已开启" if checked else "通讯录同步时自动上传：已关闭")
 
     def _set_delete_after_upload(self, checked):
         if checked:

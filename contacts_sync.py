@@ -281,6 +281,8 @@ class ContactsSyncMixin:
         self._dl_total = 0
         self._dl_success = 0
         self._dl_fail = 0
+        # 上一轮「云端已是高画质」的跳过数不能带进新一轮，否则收尾统计会累加
+        self._dl_skip = 0
         self._dl_author = None
         self._dl_progress.clear()
         self._dl_meter.reset()
@@ -512,6 +514,9 @@ class ContactsSyncMixin:
         fails = list(getattr(self, "_sync_failed_authors", []))
         text = (f"全部同步完成：成功 {self._sync_total_new} 个作品，"
                 f"失败 {self._sync_total_fail} 个")
+        skipped = int(getattr(self, "_dl_skip", 0) or 0)
+        if skipped:
+            text += f"，云端已是高画质跳过 {skipped} 个"
         if fails:
             text += f"，{len(fails)} 位作者读取失败"
         sync_log.append_event(text)
@@ -601,6 +606,27 @@ class ContactsSyncMixin:
             return bool(checker(author_folder, (new_name, tar_name, folder_name)))
         except Exception:  # noqa: BLE001
             return False
+
+    def _cloud_upgrade_candidate(self, work):
+        """云端已有备份、但这次解析出的画质更高时，纳入「下载前核对」。
+
+        只有开关打开、自动上传也开着（否则重下后无法覆盖云端）时才成立。
+        图集不参与：签名模板图改参数会被 403，没有更高画质可拿。
+        """
+        if not getattr(self, "_cloud_upgrade_flag", False):
+            return False
+        if not getattr(self, "_auto_upload_flag", False):
+            return False
+        if work.is_album() or not work.has_video():
+            return False
+        if not (getattr(work, "width", 0) and getattr(work, "height", 0)):
+            return False
+        dm = getattr(self, "dm", None)
+        if dm is None:
+            return False
+        # 下载线程只对名单里的作品做远端探测，其余作品不受影响
+        dm.upgrade_ids.add(work.aweme_id)
+        return True
 
     def _rename_author_folder(self, author, old_name, old_uid, old_folder, new_folder):
         """昵称/抖音号变化时，把旧作者文件夹改名，并更新历史记录里的路径。"""
@@ -777,6 +803,7 @@ class ContactsSyncMixin:
             return
         pending = []
         skipped = 0
+        upgrade_checks = 0
         work_folders = {}
         # 先扫一次作者目录，拿到已存在的条目名（作品 tar 或旧版作品文件夹）。
         # 名字对不上的作品直接判定为未下载，省掉每个作品一次 os.scandir。
@@ -802,7 +829,13 @@ class ContactsSyncMixin:
             if not on_disk:
                 # 本地可能被「上传后删除」清空了：云端已有备份就别再下一遍。
                 if self._work_in_cloud(author_folder, new_name, tar_name, folder_name):
-                    skipped += 1
+                    # 云端那份可能是老的低画质备份：开关打开时先核对分辨率，
+                    # 确实更低才重下（下载线程里探测，不卡这里）。
+                    if self._cloud_upgrade_candidate(work):
+                        pending.append(work)
+                        upgrade_checks += 1
+                    else:
+                        skipped += 1
                 else:
                     pending.append(work)
                 continue
@@ -831,9 +864,12 @@ class ContactsSyncMixin:
         self._dl_total = len(self._dl_jobs)
         self._dl_mode = "sync"
         self._dl_author = None
+        new_count = max(0, len(pending) - upgrade_checks)
+        upgrade_note = (f"，核对云端画质 {upgrade_checks} 个"
+                        if upgrade_checks else "")
         self.contact_status.setText(
             f"已发现 {author.label()} 的 {total_works} 个作品："
-            f"新增 {len(pending)} 个，跳过已下载 {skipped} 个"
+            f"新增 {new_count} 个{upgrade_note}，跳过已下载 {skipped} 个"
             f"（已加入并发下载队列）{profile_note}")
         self.dm.enqueue(jobs, start_index=start_index)
         # 不等待这批下载完成：worker 结束后槽位自动释放，由 _sync_dispatch
