@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """后台任务线程：把函数丢进 QThread 执行，结果用信号回主线程。
 
-独立成模块是为了让 webdav_panel / contacts_sync / player_entry 这些 mixin
+独立成模块是为了让 webdav_panel / contacts_sync 这些 mixin
 也能起线程，而不用反过来 import app（会循环导入）。
 
 退出模型：每个 Worker 自带一个 threading.Event。任务函数只要在签名里声明

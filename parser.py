@@ -46,6 +46,11 @@ _BROWSER_LOCK_TIMEOUT = 900
 _OPEN_CONTEXTS = contextvars.ContextVar("jy_open_contexts", default=None)
 
 
+# 兜底解析（只拿到播放地址、没有画质阶梯）时的画质标签：UI 与下载日志都用它，
+# 让用户能一眼看出这条不是按阶梯择优拿到的原画。
+FALLBACK_QUALITY = "兜底地址（未取到画质阶梯）"
+
+
 class ParseCancelled(Exception):
     """收到退出/停止请求，解析在安全点主动中断。"""
 
@@ -543,6 +548,23 @@ async def login_interactive(stop_event=None, timeout_s: int = 900,
         return True
 
 
+def _fallback_info(aweme_id: str, play_url: str) -> MediaInfo:
+    """只拿到播放地址时的兜底结果。
+
+    兜底地址来自页面播放器实际请求，能下但通常不是最高档（多为 720p）。
+    这里把降级写明并落 app.log，避免用户以为下到的是原画。
+    """
+    info = MediaInfo()
+    info.aweme_id = aweme_id
+    info.play_url = play_url
+    info.title = ""
+    info.quality = FALLBACK_QUALITY
+    logging.warning(
+        "detail missing, fallback to player url: aweme=%s url=%s",
+        aweme_id, (play_url or "")[:120])
+    return info
+
+
 @_serialized_browser
 async def resolve_video(raw_input: str, stage: Optional[Callable[[str], None]] = None,
                         timeout_ms: int = 60_000,
@@ -577,6 +599,19 @@ async def resolve_video(raw_input: str, stage: Optional[Callable[[str], None]] =
             aweme_id = links.extract_aweme_id(final)
             if not aweme_id:
                 raise ParseError("没有找到有效的抖音链接")
+            # 短链会跳到 H5 分享页（iesdouyin.com/share/video/...）。那个页面
+            # 不请求 /aweme/detail/，探针抓不到元数据，只能退回播放地址兜底，
+            # 而兜底地址通常只有 720p。拿到 id 后回到桌面作品页，才能走到带
+            # 完整 bit_rate 清晰度阶梯的详情接口，拿到原画档。
+            _check_cancel(cancel_event)
+            await say("正在打开作品页…")
+            try:
+                await page.goto(links.video_page_url(aweme_id),
+                                wait_until="domcontentloaded")
+            except Exception:
+                # 页面跳转/刷新失败时保持当前页，后面还有兜底逻辑
+                await page.wait_for_timeout(1500)
+            _check_cancel(cancel_event)
         await say("正在等待视频数据…")
 
         detail_text = ""
@@ -622,12 +657,8 @@ async def resolve_video(raw_input: str, stage: Optional[Callable[[str], None]] =
 
         # 兜底：页面捕获到的播放地址
         if play_url:
-            info = MediaInfo()
-            info.aweme_id = aweme_id
-            info.play_url = play_url
-            info.title = ""
-            await say("解析完成（播放地址兜底）")
-            return info
+            await say("解析完成（播放地址兜底，画质可能不是最高档）")
+            return _fallback_info(aweme_id, play_url)
         raise ParseError("解析失败。抖音页面可能要求验证，请重新解析或先完成登录。")
 
 

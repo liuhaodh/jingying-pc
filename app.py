@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 """净影 · 电脑版主窗口（PySide6）。功能对齐 Android v1.3.0：
-单条解析下载 / 主页批量 / 通讯录自动同步全部作品（含音乐）/ 抖音式播放器。
+单条解析下载 / 主页批量 / 通讯录自动同步全部作品（含音乐）。
 
 本文件只保留主窗口骨架与单条解析、批量、历史列表；三块较大的业务逻辑放在
 独立模块里，以 mixin 形式组合进 MainWindow：
 
 - `webdav_panel.WebdavMixin`     WebDAV 上传、进度、上传后清理
 - `contacts_sync.ContactsSyncMixin` 通讯录同步状态机、失败重试
-- `player_entry.PlayerMixin`     播放器信息流与入口
-- `workers.Worker`               后台任务线程（三个 mixin 共用）
+- `workers.Worker`               后台任务线程（各 mixin 共用）
 """
 import glob
 import os
@@ -39,7 +38,6 @@ import store as store_mod
 import transfer
 from contacts_sync import ContactsSyncMixin
 from models import MediaInfo
-from player_entry import PlayerMixin
 from webdav_panel import WebdavMixin
 from workers import Worker
 
@@ -65,7 +63,7 @@ def _card() -> QFrame:
 LINK_HINT = "粘贴抖音作品链接 / 创作者主页链接\n例如：https://www.douyin.com/video/… 或 https://www.douyin.com/user/MS4wLjABAAAA…"
 
 
-class MainWindow(WebdavMixin, ContactsSyncMixin, PlayerMixin, QWidget):
+class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
     login_signal = Signal(str)
     THREAD_CHOICES = (2, 3, 4, 6, 8)
     # 后台 maintenance 读到历史后发给界面的标记：收到即渲染列表，不等后续扫盘。
@@ -97,7 +95,6 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, PlayerMixin, QWidget):
         self._logged_in = None
         self._account_count = max(1, min(5, len(config.SESSION_DIRS)))
         self._account_logged = [None] * self._account_count
-        self.player = None
         self._check_worker = None
         self._webdav = self._load_webdav_config()
         self._upload_bridge = None
@@ -784,7 +781,8 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, PlayerMixin, QWidget):
             # 批量下载都是同一位作者：剩余 = 总作品数 - 已完成数
             remaining = max(0, self._dl_total - self._dl_done)
             download_log.append(
-                work.safe_author(), work.display_title()[:50], remaining)
+                work.safe_author(), work.display_title()[:50], remaining,
+                quality=work.quality)
         else:
             author = (self._dl_authors[index]
                       if index < len(self._dl_authors) else self._dl_author)
@@ -797,7 +795,8 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, PlayerMixin, QWidget):
                     remaining = max(0, pending - 1)
                     self._sync_author_remaining[author.sec_uid] = remaining
                     download_log.append(
-                        author.label(), work.display_title()[:50], remaining)
+                        author.label(), work.display_title()[:50], remaining,
+                        quality=work.quality)
             self._sync_total_new += 1
             fetched = min(self._sync_index, len(self._sync_queue))
             self.contact_status.setText(
@@ -2098,9 +2097,9 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, PlayerMixin, QWidget):
         self._dl_progress[index] = value
         self.download_panel.set_item_progress(self._dl_key(index), value)
 
-    # ---------- 历史 / 播放 ----------
-    # 播放器入口在 player_entry.PlayerMixin，WebDAV 上传在 webdav_panel.WebdavMixin，
-    # 通讯录同步在 contacts_sync.ContactsSyncMixin。
+    # ---------- 历史 ----------
+    # WebDAV 上传在 webdav_panel.WebdavMixin，通讯录同步在
+    # contacts_sync.ContactsSyncMixin。
     def _render_history(self, reset=True):
         if reset:
             self.history_page = 1
@@ -2215,16 +2214,6 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, PlayerMixin, QWidget):
                     window.close()
                 except Exception:  # noqa: BLE001
                     pass
-        # 播放器是独立顶层窗口（没有 parent）：不关它的话关闭主窗口后进程不退出，
-        # 而此时 store 已经 close，播放器里再点「同步」会往已关闭的写线程提交数据。
-        # PlayerWindow.closeEvent 自己会停掉视频/音乐/定时器。
-        player = getattr(self, "player", None)
-        if player is not None:
-            try:
-                player.close()
-            except Exception:  # noqa: BLE001
-                pass
-            self.player = None
         try:
             self.dm.stop()
         except Exception:  # noqa: BLE001

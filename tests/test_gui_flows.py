@@ -270,43 +270,6 @@ class GuiFlowTests(unittest.TestCase):
         self.assertTrue(all(path.startswith("净影/") for path in uploaded))
         self.assertEqual(self.window.upload_panel.list.count(), 2)
 
-    def test_open_player_builds_feed_from_history(self):
-        """播放器入口（PlayerMixin）：从历史组装视频 + 图集信息流并打开播放器。"""
-        video = os.path.join(self.tmp, "v.mp4")
-        with open(video, "wb") as f:
-            f.write(b"x")
-        images = []
-        for i in range(2):
-            path = os.path.join(self.tmp, f"i{i}.jpg")
-            with open(path, "wb") as f:
-                f.write(b"x")
-            images.append(path)
-
-        single = store_mod.HistoryItem()
-        single.aweme_id = "1"
-        single.title = "视频作品"
-        single.author = "测试作者"
-        single.video_path = video
-        single.create_time = 1700000000
-        album = store_mod.HistoryItem()
-        album.aweme_id = "2"
-        album.title = "图集作品"
-        album.author = "测试作者"
-        album.album_paths = images
-        album.is_album = True
-        album.create_time = 1700000100
-        self.window.store.add_history(single)
-        self.window.store.add_history(album)
-
-        self.window._open_player()
-        self.assertTrue(self._wait(lambda: self.window.player is not None, timeout=10))
-        feed = self.window.player.feed
-        self.assertEqual(len(feed), 2)
-        self.assertEqual({entry["type"] for entry in feed}, {"video", "album"})
-        # 信息流按发布时间倒序，图集在前
-        self.assertEqual(feed[0]["aweme_id"], "2")
-        self.assertEqual(len(feed[0]["images"]), 2)
-        self.window.player.close()
 
     def test_download_progress_keeps_author_name(self):
         author = store_mod.Author(SEC_UID, "测试作者", "uid1", "")

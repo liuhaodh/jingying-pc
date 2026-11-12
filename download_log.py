@@ -30,7 +30,7 @@ def _now():
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def format_line(author_name, title, remaining, when=None):
+def format_line(author_name, title, remaining, when=None, quality=""):
     who = _clean(author_name, "未知作者")
     name = _clean(title, "未命名作品")
     try:
@@ -41,7 +41,11 @@ def format_line(author_name, title, remaining, when=None):
         tail = f"该作者还剩 {remaining} 个没下完"
     else:
         tail = "该作者已全部下完"
-    return f"[{when or _now()}] 下载完成 {who} 的《{name}》，{tail}"
+    # 画质写进日志，用户能直接核对下到的是不是原画；缺省时保持原格式，
+    # 老日志与既有测试不受影响。
+    grade = _clean(quality, "")
+    tag = f"，画质 {grade}" if grade else ""
+    return f"[{when or _now()}] 下载完成 {who} 的《{name}》{tag}，{tail}"
 
 
 def format_start_line(author_name, title, when=None):
@@ -66,13 +70,15 @@ def format_open_line(account_label, author_name, found, when=None):
     return f"[{when or _now()}] 用 {account} 打开了 {author}，找到了 {found} 个作品"
 
 
-def append(author_name, title, remaining, when=None):
+def append(author_name, title, remaining, when=None, quality=""):
     """追加一条「下载了某作品」的记录，返回写入的文本。
 
     when 仅测试时用；默认在入队时取当前时间，保证时间戳是事件发生的时间。
+    quality 是解析出的画质标签（如「原画 2160p · H.265」），方便核对是否原画。
     """
     return line_log.append(
-        _path(), format_line(author_name, title, remaining, when=when))
+        _path(), format_line(author_name, title, remaining, when=when,
+                             quality=quality))
 
 
 def append_start(author_name, title, when=None):
