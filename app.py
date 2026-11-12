@@ -2376,6 +2376,12 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
                                 getattr(worker, "task", worker))
                 worker.terminate()
                 worker.wait(500)
+        # 上传后删除本地媒体的后台队列：关窗时先通知它收尾，避免它随进程
+        # 被硬杀在 os.remove 中间（daemon 线程不会阻止退出，但能等就等一下）。
+        try:
+            self.shutdown_local_cleanup()
+        except Exception:  # noqa: BLE001
+            pass
         try:
             self.store.close()
         except Exception:  # noqa: BLE001

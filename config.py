@@ -11,7 +11,7 @@ APP_NAME = "净影"
 # 唯一版本真源：窗口标题 / exe 版本资源 / CHANGELOG / zip 名 / git tag 全部
 # 从这里读。发版时只改这一行，再执行 `python build_release.py`；不要在其他
 # 地方手写版本号，否则又会出现「改了代码但版本号不变」。
-APP_VERSION = "1.6.2"
+APP_VERSION = "1.6.3"
 
 # 项目根目录（随脚本位置）
 ROOT = os.path.dirname(os.path.abspath(__file__))

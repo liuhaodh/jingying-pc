@@ -549,13 +549,18 @@ class GuiFlowTests(unittest.TestCase):
 
         sync_once()
         self.assertEqual(len(uploaded), 2)
-        # 视频已从本地删除（目录里没有别的文件，作品目录也一并清掉）
-        for index in range(2):
-            work_dir = os.path.join(config.SAVE_ROOT, author_folder,
-                                    str(_work(index).aweme_id))
-            self.assertFalse(
-                os.path.exists(os.path.join(work_dir, "视频.mp4")),
-                f"{work_dir} 里的视频没有被删除")
+        # 上传后删除本地媒体现在走后台队列（主线程不再被 os.remove 卡住），
+        # 所以这里等队列跑完再断言；目录里没有别的文件，作品目录也一并清掉。
+        media_paths = [
+            os.path.join(config.SAVE_ROOT, author_folder,
+                         str(_work(index).aweme_id), "视频.mp4")
+            for index in range(2)
+        ]
+        self.assertTrue(
+            self._wait(
+                lambda: all(not os.path.exists(p) for p in media_paths),
+                timeout=10),
+            "上传成功后的本地视频没有被后台删除")
         # 上传记录里留下了「已备份」凭证
         self.assertTrue(self.window._work_backed_up(
             author_folder, (str(_work(0).aweme_id), "", "")))

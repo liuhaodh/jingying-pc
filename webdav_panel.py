@@ -7,6 +7,7 @@
 """
 import logging
 import os
+import queue
 import threading
 import time
 
@@ -121,6 +122,66 @@ class WebdavMixin:
             f"上传中：完成 {counts.get('ok', 0)}，跳过 {counts.get('skipped', 0)}，"
             f"失败 {counts.get('failed', 0)}")
 
+    # ---------- 上传后清理本地媒体：后台队列 ----------
+    def _init_local_cleanup(self):
+        """懒初始化删除队列；只在第一次上传成功时创建线程。"""
+        if getattr(self, "_local_cleanup_lock", None) is not None:
+            return
+        self._local_cleanup_lock = threading.Lock()
+        self._local_cleanup_queue = queue.Queue()
+        self._local_cleanup_pending = set()
+        self._local_cleanup_thread = None
+
+    def _submit_local_cleanup(self, rel):
+        """把「云端已确认」的本地媒体交给后台线程删除，主线程只负责入队。
+
+        上传完成信号是 Qt 主线程回调。以前这里直接 os.remove：某些环境会为
+        每次删除做安全校验（回收站 + 子进程确认），单个文件就要几秒，同步时
+        几百个文件能把界面冻结几十秒——看门狗实测 UI stall 13~36s，栈顶全是
+        os.remove。删文件是纯 IO，没有理由占着主线程。
+        """
+        rel = str(rel or "").replace("\\", "/").strip("/")
+        if not rel:
+            return
+        self._init_local_cleanup()
+        with self._local_cleanup_lock:
+            if rel in self._local_cleanup_pending:
+                return
+            self._local_cleanup_pending.add(rel)
+            thread = self._local_cleanup_thread
+            if thread is None or not thread.is_alive():
+                thread = self._local_cleanup_thread = threading.Thread(
+                    target=self._local_cleanup_loop,
+                    name="jy-local-cleanup", daemon=True)
+                thread.start()
+        self._local_cleanup_queue.put(rel)
+
+    def _local_cleanup_loop(self):
+        q = self._local_cleanup_queue
+        while True:
+            rel = q.get()
+            try:
+                if rel is None:  # 关窗哨兵
+                    return
+                try:
+                    self._delete_uploaded_media(rel)
+                except Exception:  # noqa: BLE001 - 单个文件失败不能拖垮队列
+                    logging.exception("delete uploaded local media failed: %s", rel)
+                finally:
+                    with self._local_cleanup_lock:
+                        self._local_cleanup_pending.discard(rel)
+            finally:
+                q.task_done()
+
+    def shutdown_local_cleanup(self, timeout=2.0):
+        """关窗时通知后台删除线程收尾；daemon 线程不会阻止进程退出。"""
+        self._init_local_cleanup()
+        with self._local_cleanup_lock:
+            thread = self._local_cleanup_thread
+        self._local_cleanup_queue.put(None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout)
+
     # ---------- 上传后清理本地媒体 ----------
     def _delete_uploaded_media(self, remote_rel):
         """远程确认成功后，删除对应本地媒体；文案和作者资料永不删除。"""
@@ -157,12 +218,16 @@ class WebdavMixin:
         logging.info("deleted uploaded local media %s", path)
 
     def _delete_after_upload(self, rel):
-        """单个文件确认在云端后立刻删本地媒体（受「上传后删除」开关控制）。"""
+        """单个文件确认在云端后排队删本地媒体（受「上传后删除」开关控制）。
+
+        只做记账 + 读开关 + 入队；真正的 os.remove 在后台线程，避免主线程
+        被每个文件的安全删除校验拖住。
+        """
         self._note_uploaded_unit(rel)
         cb = getattr(self, "webdav_delete_cb", None)
         if cb is None or not cb.isChecked():
             return
-        self._delete_uploaded_media(rel)
+        self._submit_local_cleanup(rel)
 
     # ---------- 云端画质核对（低画质自动重下） ----------
     def _cloud_upgrade_enabled(self):
@@ -365,6 +430,8 @@ class WebdavMixin:
         这里只处理本轮升级重下留下的副本，避免用户在没开全局清理时也悄悄
         多出一份 4K 文件。只删「刚传完的那个文件」：同一作品的音乐/图片可能
         还没传完，提前删本地会让上传线程读不到文件。
+
+        集合的摘除留在主线程（和写入方同线程），删文件交给后台队列。
         """
         paths = getattr(self, "_upgrade_delete_paths", None)
         if not paths:
@@ -375,8 +442,8 @@ class WebdavMixin:
         paths.discard(key)
         if not paths:
             self._upgrade_delete_paths = set()
-        logging.info("upgrade re-download uploaded, deleting local %s", key)
-        self._delete_uploaded_media(key)
+        logging.info("upgrade re-download uploaded, queued local delete %s", key)
+        self._submit_local_cleanup(key)
 
     def _set_cloud_upgrade(self, checked):
         """「云端低画质时重下」开关：持久化，并给用户讲清代价。"""
