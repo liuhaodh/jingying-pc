@@ -194,6 +194,15 @@ def build_work_folder(info, author_name: str) -> str:
     return f"{author}_{title}_{stamp}"
 
 
+# GSLB 前置节点会把抖音真实来源主机名写在路径里，或用 http_x-tos-host 指明。
+_TRUSTED_ORIGIN_MARKERS = (
+    ".douyinvod.com/", ".douyincdn.com/", ".douyinstatic.com/",
+)
+_TRUSTED_ORIGIN_SUFFIXES = (
+    ".douyinvod.com", ".douyincdn.com", ".douyinstatic.com",
+)
+
+
 def _is_allowed_host(url: str) -> bool:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https"):
@@ -207,6 +216,18 @@ def _is_allowed_host(url: str) -> bool:
     for suffix in config.ALLOWED_HOST_SUFFIXES:
         if host == suffix or host.endswith("." + suffix):
             return True
+    # 原片 play 直链还会再 302 到按区域/时间轮换的 GSLB 节点（实测出现过
+    # pkoplink.com、jspcdn.cn）。逐个补白名单永远追不上，改认 URL 自带的
+    # 抖音来源标记：路径里带真实主机名，或 http_x-tos-host 参数指回抖音，
+    # 且必须具备视频直链特征，避免任意站点靠伪造路径绕过白名单。
+    path = parsed.path.lower()
+    query = urllib.parse.parse_qs(parsed.query.lower())
+    tos_host = (query.get("http_x-tos-host") or [""])[0]
+    video_like = "/video/tos/" in path or "u_reqid" in query
+    if video_like and any(marker in path for marker in _TRUSTED_ORIGIN_MARKERS):
+        return True
+    if video_like and tos_host.endswith(_TRUSTED_ORIGIN_SUFFIXES):
+        return True
     return False
 
 

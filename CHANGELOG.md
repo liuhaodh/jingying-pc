@@ -4,6 +4,34 @@
 窗口标题、exe 版本资源、便携目录 / zip 名、CHANGELOG 段落和 git tag 全部由它派生。
 版本规则遵循语义化版本：修复 bug 升 patch，功能/行为变更升 minor，破坏性变更升 major。
 
+## [v1.6.6] - 2026-11-13
+
+### 修复：全量同步收尾后的 Qt 崩溃与 GSLB 域名误拒
+
+- **长时间同步收尾崩溃**：v1.6.5 跑完一轮完整通讯录同步（成功 6060 个作品、
+  跳过 24657 个）约 8 分钟后，进程在 `QtWidgets.pyd` 触发 `0xc0000005` 退出
+  （Windows 事件日志 Application Error 1000）。根因是 `setItemWidget` 挂的
+  自定义行不会被 `QListWidget.clear()` / `takeItem()` 回收：上万条任务记录
+  会在 viewport 上留下成千上万个孤儿 QWidget，同步结束重建通讯录列表时
+  Qt 布局/重绘踩到失效对象。现在传输列表裁剪、`clear_items`、`sync_from`
+  以及通讯录列表重建前都先 `removeItemWidget` + `deleteLater`，`_rows` 与
+  控件生命周期同步；所有访问行控件前检查 C++ 对象有效性，迟到信号安全跳过。
+  通讯录行的滚动恢复改用带 parent 的 `QTimer`，窗口销毁后不再有迟到回调。
+- **关窗时可能强杀清理线程**：`_cleanup_uploaded_media_async` 的任务不响应
+  停止请求，关窗等 3 秒后会走 `QThread.terminate()`，可能停在 `os.remove`
+  中间。现在任务接收 `stop_event` 并在每个循环检查点协作退出；`stage` 信号
+  直连 `QLabel.setText`，不再用捕获窗口的 lambda。
+- **原片 CDN 轮换域名**：全量同步实测到 `iqhvbghbvehek.jspcdn.cn` 二次跳转
+  被「不允许的域名」拒绝。逐个补白名单追不上按区域/时间轮换的 GSLB 节点，
+  改为识别 URL 自带的抖音来源标记（路径里的真实主机名或 `http_x-tos-host`
+  参数）且必须具备视频直链特征；`jspcdn.cn` 同时进白名单兜底。伪造来源但
+  无视频特征的 URL 仍被拒绝。
+- **诊断增强**：`main()` 启用 `faulthandler`，C 层崩溃的线程栈单独写到
+  `JingYingData/faulthandler.log`。
+- **回归**：新增 `tests/test_widget_lifecycle.py` 6 用例（含 400 行连续插入
+  的控件泄漏压力测试、失效行跳过、镜像面板回收）；CDN 轮换域名与伪造来源
+  用例补进 `test_original_session_thread.py`。
+
 ## [v1.6.5] - 2026-11-13
 
 ### 修复：第二轮真实同步监控暴露的两个回归

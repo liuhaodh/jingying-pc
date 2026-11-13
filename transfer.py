@@ -10,9 +10,45 @@ from PySide6.QtWidgets import (
     QProgressBar, QSizePolicy, QVBoxLayout, QWidget,
 )
 
+try:  # PySide6 一定带 shiboken6；留个兜底，避免裁剪/打包环境差异导致 import 失败
+    from shiboken6 import isValid as _qt_valid
+except ImportError:  # pragma: no cover
+    def _qt_valid(obj):
+        return obj is not None
+
 MB = 1024.0 * 1024.0
 # 传输列表最多保留的行数：行数越多，insertItem(0) 重排所有 itemWidget 越慢。
 MAX_VISIBLE_ROWS = 60
+
+
+def _dispose_row_widget(widget):
+    """显式回收 setItemWidget 挂上去的自定义行。
+
+    QListWidget.clear()/takeItem() 只删 QListWidgetItem，挂在 viewport 上的
+    QWidget 不会被自动回收。一轮全量同步有上万条记录时，会累积上千个孤儿
+    QWidget（每个含 3 个 QLabel + 进度条 + 布局），Qt 在后续布局/重绘里可能
+    直接 0xc0000005 崩在 QtWidgets.pyd。removeItemWidget 可能已经由 Qt 删掉
+    C++ 对象，所以这里先判有效性再操作。
+    """
+    if widget is None or not _qt_valid(widget):
+        return
+    try:
+        widget.setParent(None)
+        widget.deleteLater()
+    except RuntimeError:  # C++ 对象已被 Qt 删除
+        pass
+
+
+def dispose_list_widgets(list_widget):
+    """清空 QListWidget 前调用：解绑并回收所有自定义行 widget。"""
+    if list_widget is None:
+        return
+    for index in range(list_widget.count()):
+        item = list_widget.item(index)
+        widget = list_widget.itemWidget(item)
+        if widget is not None:
+            list_widget.removeItemWidget(item)
+            _dispose_row_widget(widget)
 
 
 def format_rate(bytes_per_sec) -> str:
@@ -195,9 +231,14 @@ class TransferPanel(QFrame):
     def add_item(self, key, title):
         row = self._rows.get(key)
         if row is not None:
-            row["title"].setText(title)
-            row["title"].setToolTip(title)
-            return
+            # 迟到的信号可能拿到已经被回收的行：别再碰失效的 C++ 对象。
+            if not _qt_valid(row.get("widget")):
+                self._rows.pop(key, None)
+            else:
+                row["title"].setText(title)
+                row["title"].setToolTip(title)
+                row["title_text"] = title
+                return
         # 长队列同步时不再无限 insert0/remove。行数越多，每次 insertItem(0)
         # 要重排的 itemWidget 就越多；60 行足够看清单轮进度，也把主线程
         # 的单次重排成本压下来（UI 看门狗曾在此处抓到 3~4s 卡顿）。
@@ -251,16 +292,26 @@ class TransferPanel(QFrame):
             self.list.insertItem(0, item)
             self.list.setItemWidget(item, widget)
             while self.list.count() > MAX_VISIBLE_ROWS:
-                last = self.list.takeItem(self.list.count() - 1)
-                if last is not None:
-                    old_key = last.data(Qt.ItemDataRole.UserRole)
-                    self._rows.pop(old_key, None)
+                last = self.list.item(self.list.count() - 1)
+                if last is None:
+                    break
+                old_key = last.data(Qt.ItemDataRole.UserRole)
+                old_widget = self.list.itemWidget(last)
+                # 先解绑 widget（Qt 可能顺手删掉 C++ 对象），再摘 item，
+                # 最后把 Python 侧引用丢掉，避免留下悬空 wrapper。
+                self.list.removeItemWidget(last)
+                old_row = self._rows.pop(old_key, None)
+                _dispose_row_widget(old_widget or (old_row or {}).get("widget"))
+                self.list.takeItem(self.list.count() - 1)
         finally:
             self.list.setUpdatesEnabled(True)
 
     def update_item(self, key, status):
         row = self._rows.get(key)
         if row is None:
+            return
+        if not _qt_valid(row.get("widget")):
+            self._rows.pop(key, None)
             return
         row["status"].setText(status)
         if status in ("完成", "跳过（已上传）"):
@@ -269,6 +320,9 @@ class TransferPanel(QFrame):
     def set_item_progress(self, key, percent):
         row = self._rows.get(key)
         if row is None:
+            return
+        if not _qt_valid(row.get("widget")):
+            self._rows.pop(key, None)
             return
         try:
             percent = int(max(0, min(100, float(percent))))
@@ -288,6 +342,9 @@ class TransferPanel(QFrame):
         for key in self.item_keys():
             row = self._rows.get(key)
             if row is None:
+                continue
+            if not _qt_valid(row.get("widget")):
+                self._rows.pop(key, None)
                 continue
             result.append({
                 "key": key,
@@ -312,16 +369,21 @@ class TransferPanel(QFrame):
         wanted = {entry["key"]: entry for entry in entries}
         # 删除对方已经清掉的任务
         for i in range(self.list.count() - 1, -1, -1):
-            key = self.list.item(i).data(Qt.ItemDataRole.UserRole)
+            item = self.list.item(i)
+            key = item.data(Qt.ItemDataRole.UserRole)
             if key not in wanted:
+                old_widget = self.list.itemWidget(item)
+                self.list.removeItemWidget(item)
+                old_row = self._rows.pop(key, None)
+                _dispose_row_widget(old_widget or (old_row or {}).get("widget"))
                 self.list.takeItem(i)
-                self._rows.pop(key, None)
         for entry in reversed(entries):
             key = entry["key"]
-            if key not in self._rows:
+            row = self._rows.get(key)
+            if row is None or not _qt_valid(row.get("widget")):
+                self._rows.pop(key, None)
                 self.add_item(key, entry["title"])
             else:
-                row = self._rows[key]
                 if row["title_text"] != entry["title"]:
                     row["title_text"] = entry["title"]
                     row["title"].setText(entry["title"])
@@ -333,6 +395,7 @@ class TransferPanel(QFrame):
         return [row["title_text"] for row in self._rows.values()]
 
     def clear_items(self):
+        dispose_list_widgets(self.list)
         self.list.clear()
         self._rows.clear()
         self._sync_signature = None

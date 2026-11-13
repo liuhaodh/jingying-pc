@@ -524,16 +524,30 @@ class WebdavMixin:
         self._cleanup_active = True
         root = os.path.abspath(config.UPLOAD_ROOT)
 
-        def task(stage=None):
+        def task(stage=None, stop_event=None):
+            """Worker 会把 stop_event 注入进来：关窗时协作退出。
+
+            否则这个线程可能正在 os.remove（本机安全钩子还会起子进程），
+            closeEvent 等 3 秒后只能 QThread.terminate()，容易把进程带崩。
+            """
+            def stopping():
+                return stop_event is not None and stop_event.is_set()
+
             if stage:
                 stage("正在清理已上传的本地媒体…")
             deleted = 0
             failed = 0
             # 新结构在 净影/ 下，旧数据在 Videos/Music 下，三处都要扫
             for base in (config.SAVE_ROOT, config.DOWNLOAD_BASE, config.MUSIC_BASE):
+                if stopping():
+                    break
                 targets = []
                 for dirpath, _dirs, names in os.walk(base):
+                    if stopping():
+                        break
                     for name in names:
+                        if stopping():
+                            break
                         if os.path.splitext(name)[1].lower() not in MEDIA_EXTS:
                             continue
                         path = os.path.join(dirpath, name)
@@ -541,13 +555,19 @@ class WebdavMixin:
                         if self._webdav_remote_rel(rel) in files:
                             targets.append(path)
                 for path in targets:
+                    if stopping():
+                        break
                     try:
                         os.remove(path)
                         deleted += 1
                     except OSError as exc:
                         failed += 1
                         logging.warning("cleanup local media failed %s: %s", path, exc)
+                if stopping():
+                    break
                 for dirpath, _dirs, _names in os.walk(base, topdown=False):
+                    if stopping():
+                        break
                     if os.path.abspath(dirpath) == os.path.abspath(base):
                         continue
                     try:
@@ -559,9 +579,10 @@ class WebdavMixin:
             return deleted
 
         worker = Worker(task)
-        worker.stage.connect(
-            lambda text: self.status.setText(text),
-            Qt.ConnectionType.QueuedConnection)
+        # 直接连到 QLabel 的槽：QueuedConnection 会投递到控件所属的主线程，
+        # 不用 lambda 捕获 self（窗口关闭后 lambda 可能仍被投递）。
+        worker.stage.connect(self.status.setText,
+                             Qt.ConnectionType.QueuedConnection)
         worker.done.connect(self._cleanup_media_done,
                             Qt.ConnectionType.QueuedConnection)
         worker.failed.connect(self._cleanup_media_failed,

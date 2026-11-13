@@ -174,8 +174,27 @@ class OriginalCdnWhitelistTests(unittest.TestCase):
             self.assertFalse(downloader._is_allowed_host(url), url)
 
     def test_whitelist_is_in_config(self):
-        for suffix in ("pkoplink.com", "bdydns.com", "bdycdn.cn"):
+        for suffix in ("pkoplink.com", "bdydns.com", "bdycdn.cn", "jspcdn.cn"):
             self.assertIn(suffix, config.ALLOWED_HOST_SUFFIXES)
+
+    def test_rotating_gslb_host_allowed_by_origin_marker(self):
+        """GSLB 域名会轮换，靠 URL 里的抖音来源标记放行，而不是逐个补白名单。"""
+        urls = [
+            # 2026-11-13 全量同步实测被拒的跳转
+            ("https://iqhvbghbvehek.jspcdn.cn/v5-se-jltc-cold.douyinvod.com/"
+             "921bf1af/video/tos/cn/tos-cn-v-0015c800/o8GS.mp4?u_reqid=6af5fc8f"),
+            # 未来出现的新域名：query 里指回抖音真实主机
+            ("https://cdn-node-7.example-isp.net/video/tos/abc.mp4"
+             "?http_x-tos-host=v5-se.douyinvod.com&u_reqid=1"),
+        ]
+        for url in urls:
+            self.assertTrue(downloader._is_allowed_host(url), url)
+
+    def test_forged_origin_without_video_marker_still_blocked(self):
+        for url in ("https://evil.example.com/a.mp4",
+                    "https://evil.example.com/x.douyinvod.com/a.mp4",
+                    "https://evil.example.com/a.mp4?http_x-tos-host=v5.douyinvod.com"):
+            self.assertFalse(downloader._is_allowed_host(url), url)
 
 
 if __name__ == "__main__":

@@ -2009,6 +2009,10 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
             self.contact_page = 1
         old_scroll = (self.contact_list.verticalScrollBar().value()
                       if not reset else 0)
+        # clear() 只删 QListWidgetItem，不删 setItemWidget 挂的自定义行。
+        # 一轮全量同步结束会重建整个通讯录，不先回收就会留下一批孤儿
+        # QWidget，长时间运行后 Qt 在重绘时可能直接 0xc0000005。
+        transfer.dispose_list_widgets(self.contact_list)
         self.contact_list.clear()
         all_authors = self.store.load_authors()
         authors = all_authors[: self.contact_page * 40]
@@ -2026,7 +2030,9 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
             item.setSizeHint(QSize(0, 70))
             item.setToolTip(author.label() + "\n" + (signature or "无简介"))
 
-            row = QWidget(self.contact_list)
+            # 不预设 parent：setItemWidget 会把行挂到 viewport 上，显式
+            # parent 会让「解绑 → 回收」的所有权变得模糊。
+            row = QWidget()
             # 行本身不再整体透明，否则右侧“删除”按钮收不到鼠标事件；
             # 头像/文字仍然透明，不会挡住按钮点击。
             row.setToolTip(author.label() + "\n" + (signature or "无简介"))
@@ -2089,9 +2095,16 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
         self.contacts_btn.setText(f"通讯录（{len(all_authors)}）")
         if not reset:
             # clear() 会把滚动条归零；等布局更新后恢复用户原来的位置。
-            QTimer.singleShot(
-                0, lambda value=old_scroll:
-                self._restore_list_scroll(self.contact_list, value))
+            # timer 以窗口为 parent：窗口关闭后不会再有迟到回调去碰已销毁的控件。
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+
+            def restore(value=old_scroll, t=timer):
+                t.deleteLater()
+                self._restore_list_scroll(self.contact_list, value)
+
+            timer.timeout.connect(restore)
+            timer.start(0)
 
     def _delete_author(self, sec_uid, nickname):
         """从通讯录移除一位作者；不删除已下载作品和作者资料。"""
@@ -2601,6 +2614,16 @@ def run_selftest():
 def main():
     config.ensure_dirs()
     _setup_logging()
+    # C 层崩溃（例如 QtWidgets 里的 0xc0000005）不会走 Python 异常栈。
+    # 把 faulthandler 的线程栈单独落一份文件，下次再崩能直接定位。
+    try:
+        import faulthandler
+        fault_file = open(os.path.join(config.DATA_DIR, "faulthandler.log"),
+                          "a", encoding="utf-8", errors="replace")
+        faulthandler.enable(file=fault_file, all_threads=True)
+        globals()["_FAULT_LOG_FILE"] = fault_file  # 防止文件对象被 GC 回收
+    except Exception:  # noqa: BLE001
+        pass
     import logging
     logging.info("startup: args=%s", sys.argv)
     logging.info("version=%s build=%s", config.APP_VERSION, config.build_sha() or "dev")

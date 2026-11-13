@@ -11,7 +11,7 @@ APP_NAME = "净影"
 # 唯一版本真源：窗口标题 / exe 版本资源 / CHANGELOG / zip 名 / git tag 全部
 # 从这里读。发版时只改这一行，再执行 `python build_release.py`；不要在其他
 # 地方手写版本号，否则又会出现「改了代码但版本号不变」。
-APP_VERSION = "1.6.5"
+APP_VERSION = "1.6.6"
 
 # 项目根目录（随脚本位置）
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -608,7 +608,10 @@ ALLOWED_HOST_SUFFIXES = [
     # https://d6j3wcpdqlpqs.v1d.pkoplink.com/fsb9446b3f.a.bdydns.com/...
     # 参数 http_x-tos-host=*.douyinvod.com 指明真实来源；不放行会让原片在
     # 落盘前被 downloader._download_to_file 判为非法跳转并重取、最终回退转码档。
-    "pkoplink.com", "bdydns.com", "bdycdn.cn",
+    # 2026-11-13 全量同步又实测到 iqhvbghbvehek.jspcdn.cn（路径里带
+    # v5-se-jltc-cold.douyinvod.com）。白名单只是兜底，轮换域名主要靠
+    # downloader._is_allowed_host 里的「抖音来源标记」判定放行。
+    "pkoplink.com", "bdydns.com", "bdycdn.cn", "jspcdn.cn",
 ]
 
 
