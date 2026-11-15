@@ -7,6 +7,8 @@
 - 不再单独建 Music 目录；
 - 旧版 `downloads/Videos/<作者>/<作品id>.tar` 与更早的散文件目录仍能识别、能播放。
 """
+import base64
+import binascii
 import logging
 import os
 import re
@@ -174,13 +176,55 @@ def build_work_folder(info, author_name: str) -> str:
     return f"{author}_{title}_{stamp}"
 
 
-# GSLB 前置节点会把抖音真实来源主机名写在路径里，或用 http_x-tos-host 指明。
+# GSLB 前置节点会把抖音真实来源主机名写在路径里，或放在 query 参数里。
 _TRUSTED_ORIGIN_MARKERS = (
     ".douyinvod.com/", ".douyincdn.com/", ".douyinstatic.com/",
 )
 _TRUSTED_ORIGIN_SUFFIXES = (
     ".douyinvod.com", ".douyincdn.com", ".douyinstatic.com",
 )
+# 实测轮换 CDN 会把真实来源放在这些参数里；值可能是明文，也可能是省略
+# padding 的 base64（例如 real_host=djgyLW5jZG4tY29sZC5kb3V5aW52b2QuY29t
+# 解码为 v82-ncdn-cold.douyinvod.com）。adi 解码后是一串 &sp=...&ym=<host>。
+_ORIGIN_QUERY_KEYS = ("http_x-tos-host", "real_host", "adi")
+
+
+def _maybe_b64(raw: str) -> str:
+    """把 GSLB 参数值按 base64 还原成文本；不像可读文本就返回空串。"""
+    text = (raw or "").strip()
+    if len(text) < 8 or not re.match(r"^[A-Za-z0-9_=-]+$", text):
+        return ""
+    try:
+        padded = text + "=" * (-len(text) % 4)
+        decoded = base64.b64decode(padded, validate=False).decode("utf-8", "ignore")
+    except (ValueError, UnicodeError, binascii.Error):
+        return ""
+    if not decoded or sum(c.isprintable() for c in decoded) < len(decoded) * 0.9:
+        return ""
+    return decoded.lower()
+
+
+def _origin_hints(parsed) -> list[str]:
+    """取出 URL 里所有「抖音真实来源主机」线索（明文 + base64 解码结果）。"""
+    # 不能像旧代码那样把 query 整体 lower()：base64 值含大写字母，转小写会解码失败。
+    query = urllib.parse.parse_qs(parsed.query)
+    hints = []
+    for key in _ORIGIN_QUERY_KEYS:
+        raw = (query.get(key) or [""])[0]
+        if not raw:
+            continue
+        hints.append(raw.lower())
+        decoded = _maybe_b64(raw)
+        if decoded:
+            hints.append(decoded)
+    return hints
+
+
+def _is_video_like(parsed) -> bool:
+    """抖音视频直链的路径特征：用来区分 CDN 节点和任意第三方站点。"""
+    path = (parsed.path or "").lower()
+    query = urllib.parse.parse_qs(parsed.query.lower())
+    return "/video/tos/" in path or "u_reqid" in query
 
 
 def _is_allowed_host(url: str) -> bool:
@@ -190,25 +234,57 @@ def _is_allowed_host(url: str) -> bool:
     host = (parsed.hostname or "").lower()
     if not host:
         return False
-    host_ip = re.match(r"^\d+\.\d+\.\d+\.\d+$", host)
-    if host_ip:
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", host):
         return False
     for suffix in config.ALLOWED_HOST_SUFFIXES:
         if host == suffix or host.endswith("." + suffix):
             return True
     # 原片 play 直链还会再 302 到按区域/时间轮换的 GSLB 节点（实测出现过
-    # pkoplink.com、jspcdn.cn）。逐个补白名单永远追不上，改认 URL 自带的
-    # 抖音来源标记：路径里带真实主机名，或 http_x-tos-host 参数指回抖音，
+    # pkoplink.com、jspcdn.cn、*.ydycdn.cn、*.sjxydc.com、*.hbttl.cn）。
+    # 逐个补白名单永远追不上，改认 URL 自带的抖音来源标记：路径里带真实
+    # 主机名，或 query 里的 http_x-tos-host / real_host / adi 指回抖音，
     # 且必须具备视频直链特征，避免任意站点靠伪造路径绕过白名单。
+    if not _is_video_like(parsed):
+        return False
     path = parsed.path.lower()
+    if any(marker in path for marker in _TRUSTED_ORIGIN_MARKERS):
+        return True
+    return any(any(suffix in hint for suffix in _TRUSTED_ORIGIN_SUFFIXES)
+               for hint in _origin_hints(parsed))
+
+
+def _is_allowed_redirect(url: str) -> bool:
+    """重定向链上的 CDN 节点：没进白名单，但仍是抖音视频直链形态时放行。
+
+    只用于「初始 URL 已通过 _is_allowed_host」的 302 目标（有些 GSLB 节点不
+    带任何来源参数，例如 down-updatekh18.hbttl.cn）。仍要求 https/http、
+    非 IP、非本地地址、且路径是 /video/tos/，防止 302 被劫持到任意站点。
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").lower()
+    if not host or re.match(r"^\d+\.\d+\.\d+\.\d+$", host):
+        return False
+    if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+        return False
+    path = (parsed.path or "").lower()
+    if "/video/tos/" not in path:
+        return False
+    # 抖音 CDN 的标准形态是 /video/tos/<region>/tos-cn-XXXX/<object>。
+    # 只凭一个 /video/tos/ 前缀就放行，等于任何伪造路径的站点都能过。
+    tail = path.split("/video/tos/", 1)[1]
+    parts = [part for part in tail.split("/") if part]
+    if len(parts) < 3 or not parts[1].startswith("tos-cn-"):
+        return False
+    # 再要求带一个抖音 GSLB 的分发参数，避免任意站点靠拼一段相似路径蒙混过关。
     query = urllib.parse.parse_qs(parsed.query.lower())
-    tos_host = (query.get("http_x-tos-host") or [""])[0]
-    video_like = "/video/tos/" in path or "u_reqid" in query
-    if video_like and any(marker in path for marker in _TRUSTED_ORIGIN_MARKERS):
-        return True
-    if video_like and tos_host.endswith(_TRUSTED_ORIGIN_SUFFIXES):
-        return True
-    return False
+    return any(key in query for key in (
+        "x_r_id", "ydyv", "cts", "nqck", "dy_q", "dy_va_biz_cert",
+        "real_host", "adi", "http_x-tos-host", "u_reqid"))
 
 
 def _guess_ext(url: str, kind: str) -> str:
@@ -330,7 +406,7 @@ def _download_to_file(url: str, target_path: str, progress: Optional[ProgressCal
     last_percent = -1
     with _get_session().get(url, headers=headers, stream=True, timeout=(10, timeout)) as response:
         for hop in response.history:
-            if not _is_allowed_host(hop.url):
+            if not (_is_allowed_host(hop.url) or _is_allowed_redirect(hop.url)):
                 raise ValueError("跳转到不允许的域名: " + hop.url)
         if response.status_code == 416 and part_size:
             try:
@@ -338,7 +414,7 @@ def _download_to_file(url: str, target_path: str, progress: Optional[ProgressCal
             except OSError:
                 pass
             raise IOError("续传位置无效，已重置缓存，请重试")
-        if not _is_allowed_host(response.url):
+        if not (_is_allowed_host(response.url) or _is_allowed_redirect(response.url)):
             raise ValueError("跳转到不允许的域名: " + response.url)
         response.raise_for_status()
         body_len = int(response.headers.get("Content-Length", 0) or 0)

@@ -110,9 +110,11 @@ class DownloadManager(QObject):
             last = self._last_progress.get(index, -1)
             if value <= last:
                 return
-            # 进度信号太密会拖慢主线程：每个作品最多约 8 次/秒（100% 必发）
+            # 进度信号太密会拖慢主线程：8 个并发任务下 0.12s 会产生约 66 次/秒
+            # Qt 信号，长同步实测会让主线程反复卡顿。放宽到每个作品约 4 次/秒
+            # （100% 必发），视觉上仍然连续，主线程负担减半。
             if (value < 100
-                    and now - self._last_progress_time.get(index, 0.0) < 0.12):
+                    and now - self._last_progress_time.get(index, 0.0) < 0.25):
                 return
             self._last_progress[index] = value
             self._last_progress_time[index] = now

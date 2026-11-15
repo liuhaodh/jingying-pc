@@ -4,6 +4,41 @@
 窗口标题、exe 版本资源、便携目录 / zip 名、CHANGELOG 段落和 git tag 全部由它派生。
 版本规则遵循语义化版本：修复 bug 升 patch，功能/行为变更升 minor，破坏性变更升 major。
 
+## [v1.7.1] - 2026-11-15
+
+> 这两处是 v1.7.0 发行之后发现的修复，随 v1.7.1 发布；v1.7.0 的 zip 不含它们。
+> 两处都是 bug 修复，按项目规则升 patch。
+
+一次全量同步连续跑 3 小时 20 分后用户反馈「界面打不开」。只读诊断：进程存活、
+窗口可见未最小化、`Responding=True`、日志持续写入；真实原因是主线程反复卡顿
+（当前轮转日志 6170 行里 63 次 `UI stall`，峰值 45.7s，37 次栈顶在
+`transfer.add_item`），并顺带发现 66 条「跳转到不允许的域名」下载失败。
+
+### 修复
+
+- **传输面板攒批刷新**：`transfer.py` 新增 `add_items_batch()`，把 `add_item`
+  的重绘开关上移到调用方，整批只 `setUpdatesEnabled` 一次；`_add_item_now`
+  保持原有行复用语义（满 60 行零新建 QWidget）。
+  `app.py` 的 `_dl_item_started` 改为把 (key, text) 攒进队列，120ms 定时器
+  合并提交；`_dl_item_progress` / `_dl_item_done` / `_dl_item_error` /
+  `_dl_item_skipped` / `_maybe_finish_downloads` / `_begin_download_stats`
+  在查行前先 `_flush_transfer_adds()`，保证进度与状态不会写到还不存在的行上。
+  `parallel.py` 进度节流 0.12s → 0.25s（8 并发下约 66 → 32 次信号/秒）。
+- **CDN 轮换域名**：`downloader._is_allowed_host` 新增 `_maybe_b64` /
+  `_origin_hints` / `_is_video_like`，识别 `real_host`、`adi`（base64）和
+  `http_x-tos-host`，配合 `/video/tos/` 特征放行；新增
+  `_is_allowed_redirect`，用于「初始 URL 已过白名单」的 302 链，要求标准
+  `tos-cn-` 路径形态 + 至少一个 GSLB 分发参数，纯 IP / localhost / 普通路径
+  一律拒绝。`_download_to_file` 的 hop 与最终 URL 检查都接上这两层判定。
+
+### 验证
+
+- `tests/test_longrun_fixes.py` 15 个离线用例：3 条日志里的真实轮换 CDN URL、
+  base64 解码、旧版来源标记回归、5 个伪造反例、302 链端到端放行/拒绝、
+  批量插入与满 60 行行复用、以及接线回归。
+- 全量 `python run_tests.py` **421 个用例通过**（含本轮新增 15 个）。
+- 升级后**需重启程序才生效**；已下载作品靠磁盘判重，重启不会重复下载。
+
 ## [v1.7.0] - 2026-11-15
 
 本版包含三块改动：**网络策略加固**、**背景音乐补齐**、**导入 txt 对齐通讯录**，

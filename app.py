@@ -717,6 +717,8 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
         return max(1, min(8, int(self._dl_threads or 3)))
 
     def _begin_download_stats(self, total):
+        # 先刷掉上一轮可能残留的攒批行，避免新旧轮次的任务行混在一起。
+        self._flush_transfer_adds()
         self._dl_meter.reset()
         self._dl_progress.clear()
         self.download_panel.set_stats(0, 0, f"0/{max(0, total)}")
@@ -802,6 +804,7 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
         if job is None:
             return
         work = job[0]
+        self._flush_transfer_adds()
         self._dl_progress.pop(index, None)
         key = self._dl_key(index)
         self._transfer_update(key, "完成")
@@ -862,6 +865,7 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
         if job is None:
             return
         work = job[0]
+        self._flush_transfer_adds()
         self._dl_progress.pop(index, None)
         import logging
         logging.info("skip download aweme=%s: %s", work.aweme_id, reason)
@@ -898,6 +902,7 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
         job = self._dl_job(index)
         if job is None:
             return
+        self._flush_transfer_adds()
         self._dl_progress.pop(index, None)
         import logging
         work = job[0]
@@ -928,6 +933,7 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
         self._maybe_finish_downloads()
 
     def _maybe_finish_downloads(self):
+        self._flush_transfer_adds()
         if self._dl_mode is None or self._dl_done < self._dl_total:
             return
         mode = self._dl_mode
@@ -2296,22 +2302,55 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
         """
         return f"dl-{self._dl_run}-{index}"
 
+    def _queue_transfer_add(self, key, text, index, work):
+        """把「新增任务行」攒起来，120ms 内合并成一次批量 UI 更新。
+
+        长同步时每个任务都单独 add_item + update_item + set_item_progress，
+        会触发一次次主窗口整体重绘（实测 34 分钟内 63 次 UI stall，
+        37 次栈顶落在 add_item）。这里只做一次列表追加，真正的控件操作
+        交给定时器回调批量执行。
+        """
+        pending = getattr(self, "_pending_transfer_adds", None)
+        if pending is None:
+            pending = self._pending_transfer_adds = []
+        timer = getattr(self, "_transfer_flush_timer", None)
+        if timer is None:
+            timer = self._transfer_flush_timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._flush_transfer_adds)
+        pending.append((key, text, index, work))
+        if not timer.isActive():
+            timer.start(120)
+
+    def _flush_transfer_adds(self):
+        """把攒下的任务行一次性提交；其它下载回调会先调用它保证行已存在。"""
+        pending = getattr(self, "_pending_transfer_adds", None)
+        if not pending:
+            return
+        self._pending_transfer_adds = []
+        self.download_panel.add_items_batch(
+            [(key, text) for key, text, _index, _work in pending])
+        for key, _text, index, work in pending:
+            self._transfer_update(key, "下载中…")
+            self.download_panel.set_item_progress(key, 0)
+            # 「下载日志」与行显示解耦：攒批也不会漏记任务开始
+            download_log.append_start(
+                self._dl_author_label(index, work), work.display_title()[:50])
+
     def _dl_item_started(self, index):
         job = self._dl_job(index)
         if job is None:
             return
         work = job[0]
         key = self._dl_key(index)
-        self._transfer_add(key, f"{work.safe_author()} · {work.display_title()[:42]}")
-        self._transfer_update(key, "下载中…")
-        self.download_panel.set_item_progress(key, 0)
-        # 「下载日志」：任务一开始就记一条
-        download_log.append_start(
-            self._dl_author_label(index, work), work.display_title()[:50])
+        self._queue_transfer_add(
+            key, f"{work.safe_author()} · {work.display_title()[:42]}",
+            index, work)
 
     def _dl_item_progress(self, index, percent):
         if self._dl_mode is None or self._dl_job(index) is None:
             return
+        self._flush_transfer_adds()
         try:
             value = max(0, min(100, int(percent)))
         except (TypeError, ValueError):

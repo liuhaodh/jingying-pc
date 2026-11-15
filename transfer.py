@@ -269,6 +269,31 @@ class TransferPanel(QFrame):
         }
 
     def add_item(self, key, title):
+        """新增一行（同步语义不变，测试可以直接断言 list.count()）。"""
+        self.list.setUpdatesEnabled(False)
+        try:
+            return self._add_item_now(key, title)
+        finally:
+            self.list.setUpdatesEnabled(True)
+
+    def add_items_batch(self, entries):
+        """批量新增任务行：整批只开关一次重绘。
+
+        长同步时每个任务都开关一次 setUpdatesEnabled 会触发一次主窗口整体
+        重绘（实测 34 分钟内 63 次 UI stall，37 次栈顶在 add_item）。攒批后
+        连续几十个任务只在定时器回调里重绘一次。
+        """
+        if not entries:
+            return
+        self.list.setUpdatesEnabled(False)
+        try:
+            for key, title in entries:
+                self._add_item_now(key, title)
+        finally:
+            self.list.setUpdatesEnabled(True)
+
+    def _add_item_now(self, key, title):
+        """真正插入/复用一行；调用方负责关闭/恢复重绘。"""
         row = self._rows.get(key)
         if row is not None:
             # 迟到的信号可能拿到已经被回收的行：别再碰失效的 C++ 对象。
@@ -311,23 +336,20 @@ class TransferPanel(QFrame):
         row["title_text"] = title
         self._rows[key] = row
 
-        # 解绑 → 摘行 → 插到最前 → 重新绑定同一个 widget，全程关闭重绘。
-        self.list.setUpdatesEnabled(False)
-        try:
-            if reuse_item is not None:
-                old_widget = self.list.itemWidget(reuse_item)
-                self.list.removeItemWidget(reuse_item)
-                if reuse_row is None:
-                    _dispose_row_widget(old_widget)
-                elif _qt_valid(widget):
-                    # removeItemWidget 后控件仍挂在 viewport 上，先脱离 parent
-                    # 才能被 setItemWidget 重新挂回（否则会留下孤儿控件）。
-                    widget.setParent(None)
-                self.list.takeItem(self.list.count() - 1)
-            self.list.insertItem(0, item)
-            self.list.setItemWidget(item, widget)
-        finally:
-            self.list.setUpdatesEnabled(True)
+        # 解绑 → 摘行 → 插到最前 → 重新绑定同一个 widget。
+        # 重绘开关由 add_item / add_items_batch 统一负责，整批只做一次。
+        if reuse_item is not None:
+            old_widget = self.list.itemWidget(reuse_item)
+            self.list.removeItemWidget(reuse_item)
+            if reuse_row is None:
+                _dispose_row_widget(old_widget)
+            elif _qt_valid(widget):
+                # removeItemWidget 后控件仍挂在 viewport 上，先脱离 parent
+                # 才能被 setItemWidget 重新挂回（否则会留下孤儿控件）。
+                widget.setParent(None)
+            self.list.takeItem(self.list.count() - 1)
+        self.list.insertItem(0, item)
+        self.list.setItemWidget(item, widget)
 
     def update_item(self, key, status):
         row = self._rows.get(key)
