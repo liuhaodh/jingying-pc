@@ -629,6 +629,33 @@ class Store:
             self._authors = [a for a in self._author_items() if a.sec_uid != sec_uid]
             self._flush_authors(block=True)
 
+    def authors_not_in(self, sec_uids):
+        """返回不在给定 sec_uid 集合里的作者（供「按 txt 对齐通讯录」预览确认）。
+
+        保持通讯录原顺序，只读、不修改任何数据。
+        """
+        keep = set(sec_uids)
+        with self._lock:
+            return [a for a in self._author_items() if a.sec_uid not in keep]
+
+    def remove_authors(self, sec_uids):
+        """批量移除作者：一次过滤、一次落盘，返回实际移除数量。
+
+        逐个调 remove_author 会为每位作者都重写一遍 authors.json，几百位作者
+        时主线程会明显卡住。这里只落盘一次。
+        """
+        targets = set(sec_uids)
+        if not targets:
+            return 0
+        with self._lock:
+            authors = self._author_items()
+            before = len(authors)
+            self._authors = [a for a in authors if a.sec_uid not in targets]
+            removed = before - len(self._authors)
+            if removed:
+                self._flush_authors(block=True)
+            return removed
+
     def mark_saved(self, author: Author, aweme_id):
         with self._lock:
             for existing in self._author_items():

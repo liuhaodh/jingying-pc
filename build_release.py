@@ -33,6 +33,7 @@ import sqlite3
 import subprocess
 import sys
 import zipfile
+from contextlib import closing
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -221,10 +222,18 @@ def _ignore_browser_cache(directory: str, names: list[str]) -> set[str]:
 
 
 def _copy_db(src: Path, dst: Path) -> None:
-    """用 SQLite backup API 生成一致快照，避免把 -wal / -shm 半写状态带进包。"""
-    with sqlite3.connect(src.as_uri() + "?mode=ro", uri=True) as incoming:
-        with sqlite3.connect(dst) as outgoing:
+    """用 SQLite backup API 生成一致快照，避免把 -wal / -shm 半写状态带进包。
+
+    `with sqlite3.connect(...)` 只负责事务提交/回滚，**不会关闭连接**；发版时
+    两个连接一直开到进程结束，目标 db 的句柄会挡住后续压缩/重命名。用
+    contextlib.closing 显式关闭（backup 不写源库，无需事务上下文）。
+    """
+    with closing(sqlite3.connect(src.as_uri() + "?mode=ro", uri=True)) as incoming:
+        with closing(sqlite3.connect(dst)) as outgoing:
             incoming.backup(outgoing)
+            # 原来 `with sqlite3.connect(dst)` 退出时会自动 commit；换成
+            # closing 后要显式提交，否则目标库可能留下未落盘的事务。
+            outgoing.commit()
 
 
 def copy_login_data(src: Path, dst: Path) -> dict:

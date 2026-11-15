@@ -123,7 +123,25 @@ class AutoUploader(QObject):
             try:
                 self._handle(path)
             except Exception:  # noqa: BLE001
-                pass
+                # _handle 内部已经把上传失败转成 _finish_file；能漏到这里的是
+                # 记账/信号之类的意外。以前直接吞掉：_done 少一个文件，进度条
+                # 永远差一格，finished 的统计也少一条，而且排查时没有任何线索。
+                # 记日志并补一次失败记账，让队列能正常收尾。
+                logging.exception("auto upload worker failed on %s", path)
+                try:
+                    rel = os.path.relpath(path, self.root).replace("\\", "/")
+                    if self.rel_map is not None:
+                        rel = self.rel_map(rel)
+                except Exception:  # noqa: BLE001
+                    rel = str(path)
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    size = 0
+                try:
+                    self._finish_file(rel, "failed", size)
+                except Exception:  # noqa: BLE001
+                    logging.exception("auto upload accounting failed on %s", path)
         with self._lock:
             self._exit_count += 1
             last = self._exit_count >= len(self._workers)
@@ -214,5 +232,10 @@ class AutoUploader(QObject):
             else:
                 self._failed += 1
             done, total = self._done, self._total
-        self.file_done.emit(rel, status, size)
-        self.progress.emit(done, total)
+        # 记账已经在锁里完成；信号异常不能再冒泡到 _loop 的兜底分支，
+        # 否则同一个文件会被补记一次「失败」，统计重复。
+        try:
+            self.file_done.emit(rel, status, size)
+            self.progress.emit(done, total)
+        except Exception:  # noqa: BLE001
+            logging.exception("auto upload progress signal failed for %s", rel)

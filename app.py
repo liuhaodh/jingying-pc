@@ -14,8 +14,9 @@ import os
 import sys
 import threading
 import time
+from collections import OrderedDict
 
-from PySide6.QtCore import Qt, Signal, QTimer, QSize
+from PySide6.QtCore import Qt, Signal, QTimer, QSize, QEventLoop
 from PySide6.QtGui import QPixmap, QFont, QColor, QPainter, QPainterPath
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
@@ -33,6 +34,7 @@ import download_log
 import downloader
 import parallel
 import links
+import net_policy
 import original_stream
 import parser
 import store as store_mod
@@ -65,7 +67,8 @@ LINK_HINT = "粘贴抖音作品链接 / 创作者主页链接\n例如：https://
 
 
 class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
-    login_signal = Signal(str)
+    # (轮次, 错误文本)：轮次用来丢弃上一次登录超时后才回来的迟到信号。
+    login_signal = Signal(int, str)
     THREAD_CHOICES = (2, 3, 4, 6, 8)
     # 后台 maintenance 读到历史后发给界面的标记：收到即渲染列表，不等后续扫盘。
     HISTORY_READY_STAGE = "__history_ready__"
@@ -93,6 +96,7 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
         self.history_page = 1
         self._login_result = None
         self._login_running = False
+        self._login_generation = 0
         self._logged_in = None
         self._account_count = max(1, min(5, len(config.SESSION_DIRS)))
         self._account_logged = [None] * self._account_count
@@ -105,7 +109,9 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
         self._probe_lock = threading.Lock()
         self._upload_root = ""
         self._workers = []
-        self._avatar_cache = {}
+        # 有序字典做 LRU：通讯录超过 200 人后，以前一到上限就 clear()，
+        # 之后每次重建列表都要把 40 行头像全部重新解码/裁圆，越同步越慢。
+        self._avatar_cache = OrderedDict()
         self._maintenance_done = False
         self._history_rendered = False
         self._settings = self._load_settings()
@@ -190,8 +196,10 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
         self.transfer_timer.start(500)
         # 历史上可能有很多作品：扫描本地目录、补齐文件时间放到后台，避免启动卡顿。
         # 窗口先显示出来，maintenance 在后台线程跑完再刷新列表。
-        QTimer.singleShot(0, self._start_maintenance)
-        QTimer.singleShot(600, self._check_login)
+        # 传 self 作为 context：窗口先被销毁时 Qt 会取消这次回调，
+        # 不会让迟到的定时器去访问已经删除的 QWidget（RuntimeError / Qt 崩溃）。
+        QTimer.singleShot(0, self, self._start_maintenance)
+        QTimer.singleShot(600, self, self._check_login)
         # UI 卡顿看门狗：主线程超过 3 秒没有心跳时，把主线程 Python 栈写进日志，
         # 便于定位“未响应几秒后又恢复”的具体原因。
         self._ui_heartbeat = time.monotonic()
@@ -1362,7 +1370,7 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
             self._check_worker = None
             if getattr(self, "_sync_after_check", False):
                 self._sync_after_check = False
-                QTimer.singleShot(0, self._sync_all)
+                QTimer.singleShot(0, self, self._sync_all)
         if getattr(self, "_maintenance_worker", None) is worker:
             self._maintenance_worker = None
         if getattr(self, "_upload_worker", None) is worker:
@@ -1552,6 +1560,8 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
         session_dir = config.SESSION_DIRS[account_index]
         cookie_file = config.COOKIE_FILES[account_index]
         self._login_running = True
+        self._login_generation += 1
+        generation = self._login_generation
         self._login_result = None
         self._login_stop = threading.Event()
         self.login_btn.setEnabled(False)
@@ -1568,7 +1578,7 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
                 return
             except Exception as e:  # noqa: BLE001
                 error = str(e) or "登录失败"
-            self.login_signal.emit(error)
+            self.login_signal.emit(generation, error)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1581,26 +1591,49 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
         box.addButton("我已完成登录", QMessageBox.ButtonRole.AcceptRole)
         cancel = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
         box.exec()
+        cancelled = box.clickedButton() is cancel
         self._login_stop.set()
-        if box.clickedButton() is cancel:
+        if cancelled:
+            # 取消不必等后台确认 Cookie：后台线程收到 stop 后会自己收尾，
+            # 以前这里还要把 10 秒自旋走完，点「取消」像卡死一样。
             self.status.setText("已取消登录")
-        else:
-            self.status.setText("正在确认登录状态…")
+            self._login_running = False
+            self.login_btn.setEnabled(True)
+            self.account_combo.setEnabled(True)
+            return
+        self.status.setText("正在确认登录状态…")
 
-        # 等待后台线程确认 Cookie（最多 10 秒），期间处理 UI 事件。
-        import time
-        deadline = time.time() + 10
-        while self._login_result is None and time.time() < deadline:
-            QApplication.processEvents()
-            time.sleep(0.1)
+        # 等后台确认 Cookie（最多 10 秒）。以前是 processEvents()+sleep(0.1)
+        # 自旋：这 10 秒里主窗口的一切点击都会被重入派发，而且取消也要干等。
+        # 换成局部事件循环 + 定时器，并且不派发用户输入事件；跨线程的
+        # login_signal 是 queued metacall，不受 ExcludeUserInputEvents 影响。
+        loop = QEventLoop()
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(loop.quit)
+
+        def wake(gen, _error):
+            if gen == generation:
+                loop.quit()
+
+        self.login_signal.connect(wake)
+        timer.start(10000)
+        try:
+            if self._login_result is None:
+                loop.exec(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        finally:
+            timer.stop()
+            try:
+                self.login_signal.disconnect(wake)
+            except (RuntimeError, TypeError):
+                pass
+            timer.deleteLater()
 
         error = self._login_result
         self._login_running = False
         self.login_btn.setEnabled(True)
         self.account_combo.setEnabled(True)
         self.status.setText("")
-        if box.clickedButton() is cancel:
-            return
         if error is None:
             QMessageBox.warning(self, "登录", "登录状态确认超时，请重试。")
         elif error:
@@ -1610,7 +1643,11 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
             QMessageBox.information(
                 self, "登录", f"账号{account_index + 1} 登录成功，Cookie 已保存在本机。")
 
-    def _login_done(self, error):
+    def _login_done(self, generation, error):
+        # 上一次登录超时后才回来的结果不能写进新一轮：否则下次点「登录」
+        # 会立刻显示上一轮的成功/失败，甚至误报登录成功。
+        if generation != getattr(self, "_login_generation", 0):
+            return
         self._login_result = error
 
     # ---------- 结果 ----------
@@ -1653,21 +1690,38 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
         target = self._cover_path(aweme_id)
 
         def task(cancel_event=None):
-            import requests
             os.makedirs(os.path.dirname(target), exist_ok=True)
-            headers = {"User-Agent": config.DESKTOP_UA, "Referer": "https://www.douyin.com/"}
             part = target + ".part"
-            try:
-                with requests.get(url, headers=headers, timeout=(10, 20), stream=True) as resp:
+
+            def do_fetch():
+                # 统一会话 + 重试/退避，取代原来的裸 requests.get（无重试、
+                # 无连接池、无代理、UA 手工拼）。
+                with net_policy.session_for("asset").get(
+                        url, timeout=(10, 20), stream=True) as resp:
                     resp.raise_for_status()
                     with open(part, "wb") as f:
                         for chunk in resp.iter_content(64 * 1024):
                             if cancel_event is not None and cancel_event.is_set():
-                                return None
+                                raise IOError("封面下载已取消")
                             if chunk:
                                 f.write(chunk)
                 os.replace(part, target)
                 return target
+
+            try:
+                outcome = net_policy.retry_sync(
+                    do_fetch, key="asset", tag="cover",
+                    cancel_event=cancel_event,
+                    should_retry=lambda exc: (
+                        not (cancel_event is not None and cancel_event.is_set())
+                        and net_policy.policy().retry.should_retry(exc)))
+                if not outcome.ok:
+                    if cancel_event is not None and cancel_event.is_set():
+                        return None
+                    if outcome.error is not None:
+                        raise outcome.error
+                    return None
+                return outcome.value
             finally:
                 # 取消/异常时不留半截 .part（封面每次全量覆盖，没有续传语义）
                 if os.path.exists(part):
@@ -1933,14 +1987,56 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
         if not text.strip():
             QMessageBox.warning(self, "导入 txt", "文件为空或编码无法识别。")
             return
-        self._import_authors_text(text, "txt 导入")
+        # 只有 txt 导入才「按文件对齐通讯录」；批量粘贴链接仍是纯增量。
+        self._import_authors_text(text, "txt 导入", prune=True)
 
-    def _import_authors_text(self, text, source="批量导入"):
+    def _import_authors_text(self, text, source="批量导入", prune=False):
+        """导入作者主页链接。
+
+        ``prune=True``（仅「导入 txt」）：把通讯录对齐成 txt 里的作者集合，
+        txt 里没有的作者会从通讯录移除。因为涉及删除，先弹确认框；取消则整次
+        导入作废，避免出现「只加不删」的半套结果。两种模式都不会删除已下载
+        作品、历史记录或作者资料。
+        """
         sec_uids = links.extract_all_sec_uids(text)
         if not sec_uids:
             QMessageBox.warning(self, "导入", "没有识别到作者主页链接。")
             return
-        existing = {a.sec_uid for a in self.store.load_authors()}
+        if prune and self.syncing:
+            QMessageBox.information(
+                self, "导入 txt",
+                "正在同步通讯录，请先点「停止同步」再按 txt 对齐通讯录。")
+            return
+        existing_authors = self.store.load_authors()
+        existing = {a.sec_uid for a in existing_authors}
+        stale = self.store.authors_not_in(sec_uids) if prune else []
+        if stale:
+            names = "、".join(
+                str(getattr(a, "nickname", "") or "待同步") for a in stale[:5])
+            more = f" 等 {len(stale)} 位" if len(stale) > 5 else ""
+            answer = QMessageBox.question(
+                self, "按 txt 对齐通讯录",
+                f"这个 txt 里识别到 {len(sec_uids)} 位作者，通讯录现有 "
+                f"{len(existing_authors)} 位。\n\n"
+                f"将从通讯录移除 txt 中没有的 {len(stale)} 位：{names}{more}\n\n"
+                "只删除通讯录记录，不会删除已下载作品、历史记录和作者资料。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                self.contact_status.setText(f"{source}已取消，通讯录未改动。")
+                return
+        # 先删后加：删除立即落盘一次，新增统一标脏，最后再落盘一次。
+        removed_ids = {a.sec_uid for a in stale}
+        removed = self.store.remove_authors(removed_ids) if removed_ids else 0
+        if removed:
+            existing.difference_update(removed_ids)
+            # 同步失败重试队列里也要移除，否则「重试失败」会继续统计已删作者。
+            self._sync_failed_objs = [
+                a for a in getattr(self, "_sync_failed_objs", [])
+                if getattr(a, "sec_uid", None) not in removed_ids
+            ]
+            self._save_failed_authors()
+            self._update_retry_button()
         added = 0
         skipped = 0
         for sid in sec_uids:
@@ -1958,8 +2054,10 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
             self.store.flush(block=True)
         self._apply_pagination_reset()
         self._render_contacts()
+        note = f"，移出 {removed} 个" if removed else ""
         self.contact_status.setText(
-            f"{source}完成：新增 {added} 个，已存在 {skipped} 个。点「全部同步」补全资料并下载。")
+            f"{source}完成：新增 {added} 个，已存在 {skipped} 个{note}。"
+            "点「全部同步」补全资料并下载。")
 
     def _apply_pagination_reset(self):
         self.contact_page = 1
@@ -1969,6 +2067,7 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
         key = (path, name, size)
         cached = self._avatar_cache.get(key)
         if cached is not None:
+            self._avatar_cache.move_to_end(key)
             return cached
         # 头像本身只有 100×100 左右，直接解码再缩放最快；用 QImageReader 先读
         # 尺寸反而要多创建一次读取器（每个文件约 8 ms），比整张解码还慢。
@@ -1998,10 +2097,14 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
         painter.end()
         return self._cache_avatar(key, canvas)
 
-    def _cache_avatar(self, key, pixmap):
-        if len(self._avatar_cache) >= 200:
-            self._avatar_cache.clear()
-        self._avatar_cache[key] = pixmap
+    def _cache_avatar(self, key, pixmap, limit=200):
+        cache = self._avatar_cache
+        if key in cache:
+            cache.move_to_end(key)
+        cache[key] = pixmap
+        # 只淘汰最久没用的那一个，不再整表清空：上限仍然是 200 个 QPixmap。
+        while len(cache) > limit:
+            cache.popitem(last=False)
         return pixmap
 
     def _render_contacts(self, reset=True):
@@ -2250,9 +2353,18 @@ class MainWindow(WebdavMixin, ContactsSyncMixin, QWidget):
             entry.setData(Qt.ItemDataRole.UserRole, item.aweme_id)
             self.history_list.addItem(entry)
         if not reset:
-            QTimer.singleShot(
-                0, lambda value=old_scroll:
-                self._restore_list_scroll(self.history_list, value))
+            # 与通讯录一致：timer 以窗口为 parent。以前这里用无 context 的
+            # QTimer.singleShot，窗口销毁后迟到回调仍会去碰已删除的 history_list，
+            # 抛 RuntimeError 甚至踩到失效的 C++ 对象（v1.6.6 只修了通讯录）。
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+
+            def restore(value=old_scroll, t=timer):
+                t.deleteLater()
+                self._restore_list_scroll(self.history_list, value)
+
+            timer.timeout.connect(restore)
+            timer.start(0)
 
     def _open_download_dir(self):
         # 新作品都在 <下载根>/净影/作者_id/作品id/ 下；旧数据仍在 Videos 里，

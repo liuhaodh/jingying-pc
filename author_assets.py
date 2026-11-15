@@ -4,9 +4,8 @@ import hashlib
 import os
 import time
 
-import requests
-
 import config
+import net_policy
 
 MAX_SNAPSHOTS = 30
 
@@ -28,10 +27,15 @@ def _extension(url: str) -> str:
 
 def _download_avatar(url: str, sec_uid: str) -> tuple[str, str]:
     """下载头像，返回 (本地路径, sha256)。文件名带时间戳，不覆盖旧头像。"""
-    headers = {"User-Agent": config.DESKTOP_UA, "Referer": "https://www.douyin.com/"}
-    with requests.get(url, headers=headers, timeout=30) as response:
-        response.raise_for_status()
-        data = response.content
+    def do_fetch():
+        with net_policy.session_for("asset").get(url, timeout=30) as response:
+            response.raise_for_status()
+            return response.content
+
+    outcome = net_policy.retry_sync(do_fetch, key="asset", tag="avatar")
+    if not outcome.ok:
+        raise outcome.error or IOError(outcome.reason or "头像下载失败")
+    data = outcome.value
     digest = hashlib.sha256(data).hexdigest()
     stamp = time.strftime("%Y%m%d_%H%M%S")
     name = f"avatar_{stamp}_{digest[:8]}{_extension(url)}"

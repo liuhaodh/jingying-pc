@@ -228,22 +228,9 @@ class TransferPanel(QFrame):
         layout.addWidget(self.list)
 
     # ---------- 任务条目（每个任务一条独立进度条） ----------
-    def add_item(self, key, title):
-        row = self._rows.get(key)
-        if row is not None:
-            # 迟到的信号可能拿到已经被回收的行：别再碰失效的 C++ 对象。
-            if not _qt_valid(row.get("widget")):
-                self._rows.pop(key, None)
-            else:
-                row["title"].setText(title)
-                row["title"].setToolTip(title)
-                row["title_text"] = title
-                return
-        # 长队列同步时不再无限 insert0/remove。行数越多，每次 insertItem(0)
-        # 要重排的 itemWidget 就越多；60 行足够看清单轮进度，也把主线程
-        # 的单次重排成本压下来（UI 看门狗曾在此处抓到 3~4s 卡顿）。
-        if len(self._rows) >= MAX_VISIBLE_ROWS:
-            return
+    def _build_row(self, title):
+        """造一套行控件。只有列表还没满 60 行时才会调用；满了走 add_item
+        的行复用，避免长同步里每个作品都新建/销毁 QWidget。"""
         widget = QWidget()
         box = QVBoxLayout(widget)
         box.setContentsMargins(4, 3, 4, 3)
@@ -272,12 +259,7 @@ class TransferPanel(QFrame):
         bar.setFixedHeight(5)
         box.addWidget(bar)
         widget.setMinimumHeight(36)
-
-        item = QListWidgetItem()
-        item.setData(Qt.ItemDataRole.UserRole, key)
-        item.setSizeHint(QSize(0, 36))
-        self._rows[key] = {
-            "item": item,
+        return widget, {
             "widget": widget,
             "title": title_label,
             "status": status_label,
@@ -285,24 +267,65 @@ class TransferPanel(QFrame):
             "bar": bar,
             "title_text": title,
         }
-        # 插入 + 绑定 widget + 裁剪溢出行放在一次「关闭重绘」区间里，避免
-        # 每个动作都触发一遍全列表布局/重绘。
+
+    def add_item(self, key, title):
+        row = self._rows.get(key)
+        if row is not None:
+            # 迟到的信号可能拿到已经被回收的行：别再碰失效的 C++ 对象。
+            if not _qt_valid(row.get("widget")):
+                self._rows.pop(key, None)
+            else:
+                row["title"].setText(title)
+                row["title"].setToolTip(title)
+                row["title_text"] = title
+                return
+
+        # 以前满 60 行直接 return，一轮同步后面的任务全不显示；改成「每来一个
+        # 新任务就新建一套控件 + deleteLater 回收旧行」后，真实长同步实测主线程
+        # UI stall 57s 并在 Qt C 层段错误退出。现在的做法是**复用最老一行的
+        # 控件**：只改文本/进度，把它的 item 挪到顶部，全程零创建、零 deleteLater。
+        reuse_item = None
+        reuse_row = None
+        if self.list.count() >= MAX_VISIBLE_ROWS:
+            reuse_item = self.list.item(self.list.count() - 1)
+            if reuse_item is None:
+                return
+            old_key = reuse_item.data(Qt.ItemDataRole.UserRole)
+            reuse_row = self._rows.pop(old_key, None)
+
+        if reuse_row is not None and _qt_valid(reuse_row.get("widget")):
+            widget = reuse_row["widget"]
+            row = reuse_row
+            row["status"].setText("等待中…")
+            row["percent"].setText("0%")
+            row["bar"].setValue(0)
+        else:
+            widget, row = self._build_row(title)
+
+        item = reuse_item if reuse_item is not None else QListWidgetItem()
+        item.setData(Qt.ItemDataRole.UserRole, key)
+        item.setSizeHint(QSize(0, 36))
+        row["item"] = item
+        row["title"].setText(title)
+        row["title"].setToolTip(title)
+        row["title_text"] = title
+        self._rows[key] = row
+
+        # 解绑 → 摘行 → 插到最前 → 重新绑定同一个 widget，全程关闭重绘。
         self.list.setUpdatesEnabled(False)
         try:
+            if reuse_item is not None:
+                old_widget = self.list.itemWidget(reuse_item)
+                self.list.removeItemWidget(reuse_item)
+                if reuse_row is None:
+                    _dispose_row_widget(old_widget)
+                elif _qt_valid(widget):
+                    # removeItemWidget 后控件仍挂在 viewport 上，先脱离 parent
+                    # 才能被 setItemWidget 重新挂回（否则会留下孤儿控件）。
+                    widget.setParent(None)
+                self.list.takeItem(self.list.count() - 1)
             self.list.insertItem(0, item)
             self.list.setItemWidget(item, widget)
-            while self.list.count() > MAX_VISIBLE_ROWS:
-                last = self.list.item(self.list.count() - 1)
-                if last is None:
-                    break
-                old_key = last.data(Qt.ItemDataRole.UserRole)
-                old_widget = self.list.itemWidget(last)
-                # 先解绑 widget（Qt 可能顺手删掉 C++ 对象），再摘 item，
-                # 最后把 Python 侧引用丢掉，避免留下悬空 wrapper。
-                self.list.removeItemWidget(last)
-                old_row = self._rows.pop(old_key, None)
-                _dispose_row_widget(old_widget or (old_row or {}).get("widget"))
-                self.list.takeItem(self.list.count() - 1)
         finally:
             self.list.setUpdatesEnabled(True)
 

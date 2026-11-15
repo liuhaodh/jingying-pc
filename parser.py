@@ -22,6 +22,7 @@ from typing import Callable, Optional
 
 import config
 import links
+import net_policy
 import original_stream
 from models import MediaInfo, find_detail, parse_aweme
 
@@ -214,6 +215,83 @@ def _browser_args(headless: bool) -> list[str]:
     return args
 
 
+# ---------------------------------------------------------------- 网络策略接线
+def _check_goto_response(response) -> None:
+    """page.goto 拿到 403/429/5xx 时 Playwright 不抛异常，属于典型静默失败。"""
+    status = getattr(response, "status", 0)
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        return
+    if status in (403, 429) or status >= 500:
+        raise net_policy.Blocked(f"页面返回 HTTP {status}")
+
+
+async def _goto_with_retry(page, url: str, cancel_event=None,
+                           tag: str = "goto") -> bool:
+    """页面导航：先按 page 通道取令牌，再带指数退避重试。
+
+    返回是否成功。失败时**不抛异常**，让调用方沿用原有的降级逻辑（例如单条
+    解析在 goto 失败后仍会继续轮询 __JY_STATE__，页面可能自己跳转成功了）。
+    但「用户取消」必须原样抛 ParseCancelled，不能被策略层吞掉。
+    """
+    async def attempt():
+        if not await net_policy.policy().wait_async("page", cancel_event):
+            raise ParseCancelled("解析已取消")
+        response = await page.goto(url, wait_until="domcontentloaded")
+        _check_goto_response(response)
+        return response
+
+    outcome = await net_policy.retry_async(
+        attempt, key="page", tag=tag, cancel_event=cancel_event,
+        throttle=False)  # attempt 内部已自行取令牌
+    if not outcome.ok:
+        if isinstance(outcome.error, ParseCancelled) or outcome.reason == "cancelled":
+            raise ParseCancelled("解析已取消")
+        logging.warning("页面打开失败 url=%s attempts=%d reason=%s: %s",
+                        str(url)[:120], outcome.attempts, outcome.reason,
+                        str(outcome.error or "")[:160])
+    return outcome.ok
+
+
+async def _poll_video_state(page, seconds: float, cancel_event=None):
+    """在给定预算内轮询 __JY_STATE__，返回 (detail_text, play_url, last_state)。
+
+    人机校验检测从「只有打开原画质开关才做」改成始终做：以前没开开关时命中
+    校验只会一路轮询到超时，最后给用户一句笼统的「解析失败」。
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + max(0.0, seconds)
+    state = {}
+    play_url = ""
+    while loop.time() < deadline:
+        _check_cancel(cancel_event)
+        try:
+            state = await page.evaluate(
+                "() => { const s = window.__JY_STATE__ || {};"
+                " return { detail: s.detail || '', play: s.play || '',"
+                " meta: s.meta || {}, title: document.title,"
+                " url: location.href }; }"
+            )
+        except Exception:
+            # 页面正在跳转/刷新时执行上下文会被销毁，等待后重试。
+            await asyncio.sleep(1.0)
+            continue
+        url = str(state.get("url", "") or "")
+        title = str(state.get("title", "") or "")
+        if (net_policy.is_challenge(url, title)
+                or original_stream.detect_challenge(url, title)):
+            net_policy.policy().record("page", ok=False, blocked=True, status=429)
+            raise ParseError(
+                "抖音要求人机校验。请先在「登录抖音」打开的有头浏览器里完成验证，再解析。")
+        detail_text = state.get("detail", "")
+        play_url = state.get("play", "") or play_url
+        if detail_text:
+            return detail_text, play_url, state
+        await asyncio.sleep(0.7)
+    return "", play_url, state
+
+
 def _focus_browser_window():
     """把抖音登录窗口置前（Windows），避免用户找不到浏览器窗口。"""
     if os.name != "nt":
@@ -271,7 +349,10 @@ def save_cookies(cookies, cookie_file=None):
 def load_saved_cookies(cookie_file=None):
     path = cookie_file or COOKIE_FILE
     try:
-        data = json.load(open(path, encoding="utf-8"))
+        # 以前是 json.load(open(...))：句柄要等 GC 才关，Windows 上会一直占着
+        # cookies.json，登录流程重写同名文件时可能失败。
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
         if isinstance(data, list):
             return [c for c in data if isinstance(c, dict) and c.get("name")]
     except (OSError, ValueError):
@@ -585,15 +666,15 @@ async def resolve_video(raw_input: str, stage: Optional[Callable[[str], None]] =
         await say("正在解析链接…")
         aweme_id = links.extract_aweme_id(raw_input)
         if aweme_id:
-            try:
-                await page.goto(links.video_page_url(aweme_id), wait_until="domcontentloaded")
-            except Exception:
+            if not await _goto_with_retry(page, links.video_page_url(aweme_id),
+                                          cancel_event, tag="video-page"):
                 # 抖音可能在加载中跳转/刷新，继续轮询页面状态即可。
                 await page.wait_for_timeout(2000)
             _check_cancel(cancel_event)
         else:
             await say("正在打开短链…")
-            await page.goto(links.extract_url(raw_input), wait_until="domcontentloaded")
+            await _goto_with_retry(page, links.extract_url(raw_input),
+                                   cancel_event, tag="short-link")
             await page.wait_for_timeout(2500)
             _check_cancel(cancel_event)
             final = page.url
@@ -606,78 +687,79 @@ async def resolve_video(raw_input: str, stage: Optional[Callable[[str], None]] =
             # 完整 bit_rate 清晰度阶梯的详情接口，拿到原画档。
             _check_cancel(cancel_event)
             await say("正在打开作品页…")
-            try:
-                await page.goto(links.video_page_url(aweme_id),
-                                wait_until="domcontentloaded")
-            except Exception:
+            if not await _goto_with_retry(page, links.video_page_url(aweme_id),
+                                          cancel_event, tag="video-page-from-short"):
                 # 页面跳转/刷新失败时保持当前页，后面还有兜底逻辑
                 await page.wait_for_timeout(1500)
             _check_cancel(cancel_event)
         await say("正在等待视频数据…")
 
+        # 总预算切成 80% + 20%：首轮没拿到数据时，按 page 通道退避一次、
+        # 重载页面再试。总耗时不变，但能救回「首次加载被风控/网络抖动打断」。
+        budget_s = timeout_ms / 1000
         detail_text = ""
         play_url = ""
-        deadline = asyncio.get_event_loop().time() + timeout_ms / 1000
-        while asyncio.get_event_loop().time() < deadline:
-            _check_cancel(cancel_event)
-            try:
-                state = await page.evaluate(
-                    "() => { const s = window.__JY_STATE__ || {};"
-                    " return { detail: s.detail || '', play: s.play || '',"
-                    " meta: s.meta || {}, title: document.title,"
-                    " url: location.href }; }"
-                )
-            except Exception:
-                # 页面正在跳转/刷新时执行上下文会被销毁，等待后重试。
-                await asyncio.sleep(1.0)
-                continue
-            if original_stream.enabled() and original_stream.detect_challenge(
-                    state.get("url", ""), state.get("title", "")):
-                raise ParseError(
-                    "抖音要求人机校验。请先在「登录抖音」打开的有头浏览器里完成验证，再解析。")
-            detail_text = state.get("detail", "")
-            play_url = state.get("play", "")
+        for round_index, fraction in enumerate((0.8, 0.2)):
+            if round_index:
+                if not await net_policy.policy().wait_async("page", cancel_event):
+                    raise ParseCancelled("解析已取消")
+                try:
+                    await page.reload(wait_until="domcontentloaded")
+                except Exception:
+                    await page.wait_for_timeout(1000)
+                await say("首次未取到作品数据，正在重试…")
+            detail_text, play_url, _state = await _poll_video_state(
+                page, budget_s * fraction, cancel_event)
             if detail_text:
                 break
-            await asyncio.sleep(0.7)
 
+        detail = None
         if detail_text:
             try:
                 root = json.loads(detail_text)
                 detail = find_detail(root)
-                if detail:
-                    info = parse_aweme(detail)
-                    if not info.ip_location:
-                        try:
-                            body = await page.evaluate(
-                                "() => document.body ? document.body.innerText.slice(0, 8000) : ''")
-                            m = re.search(r"IP\s*属地[：:]\s*([^\s\n]+)", body or "")
-                            if m:
-                                info.ip_location = m.group(1)
-                        except Exception:
-                            pass
-                    await say("解析完成")
-                    # 原画质回捞（默认关闭）：就在同一个已登录浏览器上下文里，
-                    # 用页面自己算好签名的 detail 数据打 play 端点。任何软失效
-                    # 都只记日志，绝不阻塞原本已经成功的最高转码档解析结果。
-                    if original_stream.enabled() and detail.get("video"):
-                        await say("正在核对原始码流…")
-                        try:
-                            stream = await original_stream.resolve_original(
-                                context, page, detail)
-                            info.original_verdict = stream.verdict
-                            if stream.is_original:
-                                info.ladder_quality = info.quality
-                                info.original_url = stream.url
-                                info.original_size = stream.size
-                                info.quality = stream.label()
-                        except Exception as exc:  # noqa: BLE001 - 原片通道未开放是正常结果
-                            info.original_verdict = "unavailable"
-                            logging.warning(
-                                "original stream unavailable, keep best gear: %s", exc)
-                    return info
-            except (ValueError, KeyError):
-                pass
+            except (ValueError, KeyError) as exc:
+                logging.warning("作品详情 JSON 解析失败 aweme=%s: %s", aweme_id, exc)
+        # 「HTTP 200 但 aweme_detail 是空壳」以前会被 except: pass 静默吞掉，
+        # 直接降级成 720p 兜底。现在明确断言并记一条带原因的结构化事件。
+        reason = net_policy.check_payload(detail, "detail") if detail else ""
+        if detail and not reason:
+            info = parse_aweme(detail)
+            if not info.ip_location:
+                try:
+                    body = await page.evaluate(
+                        "() => document.body ? document.body.innerText.slice(0, 8000) : ''")
+                    m = re.search(r"IP\s*属地[：:]\s*([^\s\n]+)", body or "")
+                    if m:
+                        info.ip_location = m.group(1)
+                except Exception:
+                    pass
+            await say("解析完成")
+            # 原画质回捞（默认关闭）：就在同一个已登录浏览器上下文里，
+            # 用页面自己算好签名的 detail 数据打 play 端点。任何软失效
+            # 都只记日志，绝不阻塞原本已经成功的最高转码档解析结果。
+            if original_stream.enabled() and detail.get("video"):
+                await say("正在核对原始码流…")
+                try:
+                    stream = await original_stream.resolve_original(
+                        context, page, detail)
+                    info.original_verdict = stream.verdict
+                    if stream.is_original:
+                        info.ladder_quality = info.quality
+                        info.original_url = stream.url
+                        info.original_size = stream.size
+                        info.quality = stream.label()
+                except Exception as exc:  # noqa: BLE001 - 原片通道未开放是正常结果
+                    info.original_verdict = "unavailable"
+                    logging.warning(
+                        "original stream unavailable, keep best gear: %s", exc)
+            return info
+        if detail_text:
+            why = reason or "响应里没有 aweme_detail 节点，页面结构可能已变更"
+            logging.warning("作品详情断言失败 aweme=%s reason=%s（将走播放地址兜底）",
+                            aweme_id, why)
+            net_policy.policy().record("page", ok=False,
+                                       blocked=("风控" in why or "结构" in why))
 
         # 兜底：页面捕获到的播放地址
         if play_url:
@@ -731,7 +813,11 @@ async def resolve_profile(sec_uid: str, stage: Optional[Callable[[str], None]] =
             await _close_context(context)
             raise NeedLogin("主页作品列表需要登录，请先点「登录抖音」完成登录，再点「全部同步」。")
         await say("正在打开创作者主页…")
-        await page.goto(links.profile_page_url(sec_uid), wait_until="domcontentloaded")
+        if not await _goto_with_retry(page, links.profile_page_url(sec_uid),
+                                      cancel_event, tag="profile-page"):
+            # 导航失败时保留页面继续探测：登录/风控页也能从 innerText 判出来，
+            # 后面的 NeedLogin / 登录检测分支会给出准确提示。
+            await page.wait_for_timeout(1500)
         await page.wait_for_timeout(3000)
         _check_cancel(cancel_event)
         # 先拿主页顶部的“作品 N”或用户接口的 aweme_count，作为分页是否读完的依据
@@ -785,6 +871,13 @@ async def resolve_profile(sec_uid: str, stage: Optional[Callable[[str], None]] =
                 root = json.loads(post_text)
             except ValueError:
                 return False
+            # /aweme/post 也可能「HTTP 200 但没有 aweme_list」（风控兜底）。
+            # 以前这里直接得到空列表，滚动循环只会以为是「还没加载出来」。
+            post_reason = net_policy.check_payload(root, "post")
+            if post_reason:
+                logging.warning("主页作品响应断言失败 sec_uid=%s reason=%s",
+                                sec_uid, post_reason)
+                net_policy.policy().record("page", ok=False)
             aweme_list = root.get("aweme_list") or (root.get("data") or {}).get("aweme_list") or []
             last_page_len = len(aweme_list)
             for item in aweme_list:
@@ -805,6 +898,10 @@ async def resolve_profile(sec_uid: str, stage: Optional[Callable[[str], None]] =
 
         while asyncio.get_event_loop().time() < deadline:
             _check_cancel(cancel_event)
+            # 每滚一次都会触发一次 /aweme/post 请求；按 page 通道取令牌，
+            # 被限流时 AutoThrottle 自动放慢，避免多账号并发把账号打进频控。
+            if not await net_policy.policy().wait_async("page", cancel_event):
+                raise ParseCancelled("解析已取消")
             try:
                 await page.evaluate("() => (window.__JY_SCROLL__ && window.__JY_SCROLL__()) || 0")
             except Exception:

@@ -4,6 +4,175 @@
 窗口标题、exe 版本资源、便携目录 / zip 名、CHANGELOG 段落和 git tag 全部由它派生。
 版本规则遵循语义化版本：修复 bug 升 patch，功能/行为变更升 minor，破坏性变更升 major。
 
+## [v1.7.0] - 2026-11-15
+
+本版包含三块改动：**网络策略加固**、**背景音乐补齐**、**导入 txt 对齐通讯录**，
+并一并带上 2026-11-13 那轮静态审计修复。全量 `python run_tests.py`
+**406 个用例全部通过**（本版新增 71 个离线用例）；整套约 4~5 分钟，
+慢在离屏 GUI 冒烟，前台跑可能被超时信号打断，建议后台执行并取日志末尾的 `OK`。
+
+借鉴 [Scrapling](https://github.com/D4Vinci/Scrapling) 的 Fetcher / Spider 分层思路，
+对抓取链路做**重试 / 限流 / 反风控**加固。**零新依赖**（仍是 requests + PySide6 +
+Playwright），PyInstaller 打包形态、五账号登录态、作品目录结构、WebDAV 通道
+全部保持原样。设 `JINGYING_NET_POLICY=0` 可一键回退。
+
+> 为什么不是直接装 Scrapling：它最强的 CSS/XPath 自适应选择器针对 HTML DOM，
+> 而净影取的是页面自己发出的 XHR JSON（`resolver.js` 劫持 `Response.json`），
+> 两者不对口；引入 `scrapling[fetchers]` 还会带来浏览器/指纹依赖，拖累免安装 exe。
+> 本轮借鉴的是它的分层 Fetcher、会话复用、自动重试、AutoThrottle 与
+> blocked-request detection 这些架构手段。
+
+### 新增
+
+- `net_policy.py`：统一网络策略层，不依赖任何业务模块。
+  - `RetryPolicy`：指数退避 + 抖动 + 上限；`retry_sync` / `retry_async`
+    统一封装「限流 → 尝试 → 断言 → 退避重试 → 结构化诊断」，所有等待
+    按 0.1s 分段，取消信号随时可打断。
+  - `TokenBucket` + `AutoThrottle` + `DomainThrottle`：按 `page` / `cdn` /
+    `asset` 三个逻辑通道限流；平时延迟为 0，只有 403/429/5xx、风控特征或
+    响应明显变慢才逐步加延迟，恢复后缓慢回落；尊重 `Retry-After` 但封顶 5 秒。
+  - `check_payload` / `assert_payload` / `is_challenge`：把
+    `original_stream.assert_detail` 那种「HTTP 200 但字段空了也算失败」的判定
+    推广到作品详情和主页作品列表，风控/人机校验不再静默降级。
+  - `build_session` / `session_for`：统一 Retry（补 408/425）、UA、可选代理与
+    每线程连接池；`FetchDiagnostics` 环形缓冲记录成败、原因、耗时、自适应延迟。
+- `tests/test_net_policy.py`：40 个离线用例，假时钟推进，覆盖退避抖动、令牌桶、
+  AutoThrottle、`Retry-After` 封顶、坏数据断言、风控识别，以及「策略确实接进
+  `parallel` / `parser` / `downloader`」的接线回归。不联网、不启浏览器、不真的 sleep。
+
+### 接线与行为变化
+
+- `downloader._get_session()` 改为委托 `net_policy.session_for("cdn")`（保留函数名，
+  离线测试仍可 patch）；`_download_to_file` 在**每个媒体请求前**按 `cdn` 通道取令牌，
+  等待期间响应取消。
+- `parallel._run_one` 的「固定 `sleep(1.0)` 再试一次」换成带退避的策略重试
+  （默认 3 次）；用户取消与旧轮次仍立即结束，不重试。
+- `parser.resolve_video`：三处 `goto` 改走 `_goto_with_retry`（403/429/5xx 明确判被限流）；
+  等待预算切成 80% + 20%，首轮没拿到数据时重载页面再试一轮，**总超时不变**；
+  详情做骨架断言，坏数据记带原因的警告后才降级；人机校验改为**始终**检测
+  （以前只有打开「原画质」开关才检测）。
+- `parser.resolve_profile`：主页导航同样带重试，每次滚动前按 `page` 通道取令牌；
+  `/aweme/post` 缺 `aweme_list` 时记明确警告，不再被当成「还没加载出来」。
+- `app.py` 封面与 `author_assets.py` 头像的裸 `requests.get` 收敛到 `asset`
+  通道统一会话 + 重试。
+- `contacts_sync._sync_failed` 把错误里的频控/校验信号回灌策略，后续作者自动放慢。
+
+### 背景音乐补齐
+
+起因：作品 `7625256716829025253` 只有 `图片_01.webp` + `动图_01.mp4` + `文案.txt`
+没有音乐。查证是 `models._music_url_from()` 从 `music` 节点取不到播放地址，
+`downloader.download_work` 的 `if info.music_url:` 直接跳过，全程静默；
+同作者同批另外 4 个实况图集都有 `音乐.mp3`，排除流程/清理/图集类型问题。
+全库约 4~6% 作品没有音乐，属正常比例。
+
+- 缺音乐时记一条带原因的 INFO 日志（区分「没有 music 节点」与「music 节点缺
+  播放地址」），不再静默跳过。
+- 新增 `downloader.has_music_file()` / `download_music_only()` 与
+  `contacts_sync.music_backfill_needed()`；通讯录每轮同步对「已下载 + 本次拿到
+  音乐地址 + 本地还没有 `音乐.*`」的作品后台补下音乐，状态栏显示数量。
+- 补下载走独立轻量通道（最多 3 并发 + `cdn` 令牌桶），**不进 DownloadManager**：
+  老作品已完成下载，重走队列会用只有 `music_path` 的结果覆盖历史里的
+  `video_path` / `album_paths`。成功的文件自动加入 WebDAV 上传队列。
+- 只处理新结构散文件目录；tar 包、旧结构、媒体已被「上传后清理」删掉的作品
+  一律跳过；失败不落盘，下轮自然重试，不影响同步成败。
+- `tests/test_music_backfill.py` 新增 18 个离线用例（本地 HTTP 桩）：补齐判定、
+  已有音乐/无地址/目录不存在/取消、真实写入与日志、以及接线回归。
+
+### 导入 txt 时对齐通讯录
+
+原来「导入 txt」和「批量导入」共用 `_import_authors_text()`，只增不删。现在
+**只有「导入 txt」**会把通讯录对齐成文件里的作者集合：txt 里没有的作者会被移除。
+「批量导入」保持纯增量。
+
+- `store.py` 新增 `authors_not_in()`（只读预览）与 `remove_authors()`
+  （批量过滤 + **一次**落盘）；逐个调 `remove_author()` 会为每位作者重写一遍
+  几百 KB 的 `authors.json`，主线程会明显卡住。
+- 删除前弹确认框：显示 txt 识别数 / 通讯录现有数 / 将移除数与前 5 个名字，
+  默认「否」；取消则**整次导入作废**（连新增都不做），避免半套结果。
+- 同步中、txt 无法识别任何作者、通讯录已完全包含 txt 这几种情况都不会删人。
+- 只移除通讯录记录，不删已下载作品 / 历史 / 作者资料；同步清理
+  `_sync_failed_objs` 并刷新「重试失败」按钮；状态栏显示移出数量。
+- `tests/test_author_prune.py` 13 个用例：批量删除与落盘、幂等、确认「是/否」、
+  同步中阻断、批量导入仍只增、无法解析不删、接线回归
+  （用 MagicMock 当 self 调未绑定方法，store 与 links 是真的）。
+- 相关回归子集 171 个用例通过；上一轮完整套件 393 个用例通过。
+
+### 兼容性
+
+正常节奏下令牌桶不会触发等待（速率取得比现有实际节奏宽松），AutoThrottle 初始
+延迟为 0，因此成功路径不会变慢；总开关 `JINGYING_NET_POLICY=0` 可完全停用新策略。
+各通道速率、重试次数与退避参数、代理、UA 池均可通过环境变量覆盖，详见 README
+「网络策略」一节。
+
+## 附：2026-11-13 未发版改动（随 v1.7.0 一并发布）
+
+本轮是**静态审计 + 低风险修复**：未修改 `config.APP_VERSION`，未执行发版，
+改动可直接随下次发版一并提交。改动前源码备份在
+`.backup_opt/before_20261113_opt/`；新增 16 个回归用例，集中在
+`tests/test_opt_20261113.py`。全量 `python run_tests.py` **334 个用例全部通过**
+（改动前基线 318 个全部通过）。
+
+### 修复的缺陷
+
+- **换源重试会把两段不同码流拼成一个坏 mp4**：原片 CDN 直链失败后
+  `download_work` 会重新回捞（可能从原片降到最高转码档），但第一次留下的
+  `.part` 仍在，`_download_to_file` 带 `Range: bytes=N-` 去请求新 URL，
+  服务器返回 206 时以 `ab` 追加，最后 `os.replace` 出一个损坏的视频。
+  现在给 `_download_to_file` 加 `resume` 参数，重试一律从头覆盖写；
+  正常续传语义不变（新增 3 个正反例）。
+- **传输列表超过 60 个任务后新任务不再显示**：`TransferPanel.add_item` 在
+  `len(self._rows) >= 60` 时提前 return，让下面写好的「插入最前 + 裁剪最旧」
+  循环成了死代码——v1.6.6 那轮 6060 个作品，界面只显示前 60 个。
+  **中途有一版修复引入回归并已撤回**：直接启用裁剪（每来一个新任务就新建
+  一套 QWidget / 布局 / 进度条，再 `deleteLater` 回收最老行）后，真实通讯录
+  同步跑了两小时，主线程反复 `UI stall 57.5s / 68.7s`（栈顶 `transfer.py
+  add_item`），最终 Qt C 层段错误退出（退出码 139，crash log 为空，
+  faulthandler 主线程停在 `app.exec()`）。
+  最终改为**行复用**：满 60 行后把最老一行的 item 挪到顶部、复用同一套
+  QWidget，只改标题/状态/进度，全程零创建、零 `deleteLater`，不会累积
+  待删除控件。新增 `test_full_list_reuses_row_widgets` 断言满列表后
+  `_build_row` 调用 0 次、控件数恒定；6060 个任务连续插入/更新的离线压力
+  验证：行/控件数稳定在 60 / 300，`clear_items()` 后全部归零。
+  **行为变化**：进行中的老任务可能被新任务挤出面板，下载与统计不受影响。
+- **登录确认的 10 秒自旋**：改成 `QEventLoop` + 带 parent 的 `QTimer`，等待
+  期间不派发用户输入事件；点「取消」立即返回，不再干等满 10 秒；
+  `login_signal` 带上轮次，上一轮超时的迟到结果不会串到下一次登录、
+  误报「登录成功」。
+- **窗口销毁后的迟到回调**：`app.py` 三处无 context 的 `QTimer.singleShot`
+  补上 `self`；历史列表「加载更多」的滚动恢复改用与通讯录一致的带 parent
+  `QTimer`（v1.6.6 只修了通讯录那处）。
+- **WebDAV 自动上传 worker 意外崩溃后进度条永远差一格**：`_loop` 以前直接
+  吞掉 `_handle` 之外的异常，现在记日志并补一次「失败」记账；
+  `_finish_file` 的信号异常不再冒泡，避免重复计数。
+- **画质缓存并发**：`_load_cache` 无锁的双重赋值会让并发首次加载互相覆盖；
+  `save()` 临时文件按 pid 命名会被多线程互踩，且并发 `os.replace` 同一目标
+  在 Windows 上会 `[WinError 5]`。现加载/写缓存加锁、临时文件加线程号、
+  落盘串行化并取最新快照。
+- **自动上传状态锁的懒初始化竞态**：首次并发可能各自 new 一把锁，导致
+  20 秒节流失效、同一秒把约 10 MB 上传记录写好几遍。改用模块级专用锁
+  做双重检查（不复用业务锁，避免重入死锁）。
+- **资源句柄**：`load_saved_cookies` 的 `json.load(open(...))` 改成 `with`；
+  `build_release._copy_db` 的 `with sqlite3.connect(...)` 其实不关闭连接，
+  改用 `contextlib.closing` 并显式 `commit()`（补了数据一致性用例）。
+
+### 性能
+
+- **头像缓存不再整表清空**：通讯录超过 200 人后，以前一满就 `clear()`，
+  每次重建列表都要把 40 行头像全部重新解码/裁圆。改成 `OrderedDict` LRU，
+  上限仍是 200 个 `QPixmap`，只淘汰最久未用的一个。
+
+### 本轮没有动（附理由）
+
+- **日志窗口每次刷新仍会阻塞约 0.5 秒**：`line_log.load()` 无条件下
+  `flush(timeout=1.5)`，而写盘线程攒批窗口是 0.5 秒，正常路径也必然等满；
+  5 秒退避只覆盖「写盘卡死」，不覆盖它。这与 v1.6.5 修的「无限等锁」是
+  两回事，修它要改日志窗口读取协议，日志链路刚重构过，留待下轮。
+- **「加载更多」仍是清空重建**、**每作品一次主线程 SQLite commit**：
+  改动面比收益大，保持原样。
+- **重定向白名单校验**：属于安全边界变更，需要单独设计与回归，本轮不动。
+- README 历史章节里「登录等待自旋」这条已知短板本轮已解决；
+  「加载更多」等仍成立。
+
 ## [v1.6.6] - 2026-11-13
 
 ### 修复：全量同步收尾后的 Qt 崩溃与 GSLB 域名误拒

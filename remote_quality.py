@@ -40,6 +40,9 @@ class RemoteQualityProbe:
         # PROPFIND，几千个作品就是几千次请求，同步会明显变慢。
         self.cache_ttl = int(cache_ttl)
         self._lock = threading.Lock()
+        # 写盘单独一把锁：tmp 按线程区分还不够，Windows 上多个线程同时
+        # os.replace 到同一个目标文件会 [WinError 5] 拒绝访问。
+        self._write_lock = threading.Lock()
         self._cache = None           # {rel: {"size": int, "w": int, "h": int}}
         self._dirty = False
         self._last_save = 0.0
@@ -49,20 +52,24 @@ class RemoteQualityProbe:
         return f"{self.namespace}|{rel}" if self.namespace else rel
 
     def _load_cache(self):
-        if self._cache is not None:
-            return self._cache
-        files = {}
-        if self.cache_path:
-            try:
-                with open(self.cache_path, encoding="utf-8") as handle:
-                    data = json.load(handle)
-                if isinstance(data, dict) and isinstance(data.get("files"), dict):
-                    files = {str(k): v for k, v in data["files"].items()
-                             if isinstance(v, dict)}
-            except (OSError, ValueError):
-                files = {}
-        self._cache = files
-        return files
+        # 同步时多个下载线程会同时走 probe()：以前这里的「检查 None → 读文件 →
+        # 赋值」没有锁，两个线程可能各自加载一份，后写的覆盖先写的，刚记住的
+        # 分辨率凭空丢失，下一轮又去发一次 PROPFIND。
+        with self._lock:
+            if self._cache is not None:
+                return self._cache
+            files = {}
+            if self.cache_path:
+                try:
+                    with open(self.cache_path, encoding="utf-8") as handle:
+                        data = json.load(handle)
+                    if isinstance(data, dict) and isinstance(data.get("files"), dict):
+                        files = {str(k): v for k, v in data["files"].items()
+                                 if isinstance(v, dict)}
+                except (OSError, ValueError):
+                    files = {}
+            self._cache = files
+            return files
 
     def save(self, force=False):
         """落盘；默认 30 秒节流，避免一次同步反复重写整份缓存。"""
@@ -72,25 +79,30 @@ class RemoteQualityProbe:
             now = time.monotonic()
             if not force and now - self._last_save < 30.0:
                 return
-            files = dict(self._cache or {})
             self._dirty = False
             self._last_save = now
-        tmp = f"{self.cache_path}.{os.getpid()}.tmp"
-        try:
-            os.makedirs(os.path.dirname(self.cache_path) or ".", exist_ok=True)
-            with open(tmp, "w", encoding="utf-8") as handle:
-                json.dump({"files": files}, handle, ensure_ascii=False)
-            os.replace(tmp, self.cache_path)
-        except OSError as exc:
-            logging.warning("save remote quality cache failed: %s", exc)
+        # 串行化整段落盘：临时文件按线程区分只能避免互相覆盖 .tmp，
+        # 目标文件仍是同一个，并发 os.replace 在 Windows 上会失败。
+        # 拿锁后再取一次快照，保证最后写入的是最新全量而不是过期副本。
+        with self._write_lock:
             with self._lock:
-                self._dirty = True
-        finally:
-            if os.path.exists(tmp):
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
+                files = dict(self._cache or {})
+            tmp = f"{self.cache_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+            try:
+                os.makedirs(os.path.dirname(self.cache_path) or ".", exist_ok=True)
+                with open(tmp, "w", encoding="utf-8") as handle:
+                    json.dump({"files": files}, handle, ensure_ascii=False)
+                os.replace(tmp, self.cache_path)
+            except OSError as exc:
+                logging.warning("save remote quality cache failed: %s", exc)
+                with self._lock:
+                    self._dirty = True
+            finally:
+                if os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
 
     def _cached(self, rel, size):
         files = self._load_cache()
@@ -118,10 +130,12 @@ class RemoteQualityProbe:
         return width, height, int(entry.get("size") or 0)
 
     def _remember(self, rel, size, width, height):
+        # _load_cache 自己会拿锁，不能在 self._lock 里再调（普通 Lock 不可重入）。
         files = self._load_cache()
-        files[self._key(rel)] = {"size": int(size), "w": int(width), "h": int(height),
-                      "ts": int(time.time())}
-        self._dirty = True
+        with self._lock:
+            files[self._key(rel)] = {"size": int(size), "w": int(width),
+                                     "h": int(height), "ts": int(time.time())}
+            self._dirty = True
 
     # ---------- 探测 ----------
     def probe(self, rel_path):

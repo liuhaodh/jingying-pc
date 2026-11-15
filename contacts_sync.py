@@ -4,6 +4,7 @@
 以 mixin 的形式挂在 MainWindow 上。依赖主窗口的下载管理器（self.dm）、
 通讯录控件（contact_status / contact_sync_btn）和同步状态字段。
 """
+import logging
 import os
 import random
 import time
@@ -15,10 +16,27 @@ import author_assets
 import config
 import download_log
 import downloader
+import net_policy
 import parser
 import store as store_mod
 import sync_log
 from workers import Worker
+
+
+def music_backfill_needed(work, author_folder: str, work_folder: str) -> bool:
+    """已下载作品是否值得补背景音乐（纯函数，方便离线测试）。
+
+    三个条件同时满足才补：
+    1. 本次主页数据里出现了音乐播放地址 —— 说明平台现在给了，或上次解析漏了；
+    2. 作品目录是 2026-11-09 起的散文件结构（tar 包 / 旧结构 / 已清理的不动）；
+    3. 目录里还没有 `音乐.*`。
+    """
+    if not str(getattr(work, "music_url", "") or ""):
+        return False
+    directory = downloader.work_dir(author_folder, work_folder, work)
+    if not os.path.isdir(directory):
+        return False
+    return not downloader.has_music_file(directory)
 
 
 class ContactsSyncMixin:
@@ -425,6 +443,71 @@ class ContactsSyncMixin:
         self._track_worker(worker)
         worker.start()
 
+    def _queue_music_backfill(self, jobs):
+        """后台批量补下背景音乐，不占下载队列、不改写历史记录。
+
+        这些作品已经完成过下载：塞回 DownloadManager 会用一份只有 music_path
+        的 DownloadResult 重写历史，把 video_path / album_paths 覆盖成空。
+        所以这里只补一个文件、记日志，并加入 WebDAV 自动上传队列。
+        """
+        if not jobs:
+            return
+        inflight = getattr(self, "_music_inflight", None)
+        if inflight is None:
+            inflight = self._music_inflight = set()
+        fresh = []
+        for work, author_folder, work_folder in jobs:
+            key = str(getattr(work, "aweme_id", "") or "")
+            if not key or key in inflight:
+                continue
+            inflight.add(key)
+            fresh.append((work, author_folder, work_folder))
+        if not fresh:
+            return
+        logging.info("背景音乐补齐：本轮发现 %d 个作品可补下载", len(fresh))
+
+        def task(cancel_event=None):
+            from concurrent.futures import ThreadPoolExecutor
+            saved = []
+
+            def run_one(job):
+                work, af, wf = job
+                try:
+                    path = downloader.download_music_only(
+                        work, af, wf, cancel_event=cancel_event)
+                    if path:
+                        saved.append(path)
+                except Exception as exc:  # noqa: BLE001 - 单个作品失败不拖垮整批
+                    logging.warning("背景音乐补齐失败 aweme=%s: %s",
+                                    getattr(work, "aweme_id", ""), exc)
+                finally:
+                    inflight.discard(str(getattr(work, "aweme_id", "") or ""))
+
+            # 并发度刻意压低：补齐是「顺手做」的后台任务，不能和正在跑的
+            # 作品下载抢带宽；cdn 通道的令牌桶还会再限一层。
+            with ThreadPoolExecutor(max_workers=3,
+                                    thread_name_prefix="jy-music") as pool:
+                list(pool.map(run_one, fresh))
+            return saved
+
+        def done(paths):
+            if paths:
+                logging.info("背景音乐补齐完成 %d 个", len(paths))
+                self._queue_auto_upload_paths(paths)
+
+        def failed(message):
+            # task 内部已逐个吞异常；走到这里说明整批出了问题，必须清空
+            # inflight，否则这些作品以后再也不会被重试。
+            for work, _af, _wf in fresh:
+                inflight.discard(str(getattr(work, "aweme_id", "") or ""))
+            logging.warning("背景音乐补齐任务失败: %s", message)
+
+        worker = Worker(task)
+        worker.done.connect(done, Qt.ConnectionType.QueuedConnection)
+        worker.failed.connect(failed, Qt.ConnectionType.QueuedConnection)
+        self._track_worker(worker)
+        worker.start()
+
     def _sync_profile_done(self, author, profile, account_index=0):
         """主页解析成功的收尾；任何异常都要回到同步状态机，避免卡住。"""
         try:
@@ -440,6 +523,13 @@ class ContactsSyncMixin:
         if not self.syncing:
             return
         short = (message or "未知错误").replace("\n", " ")[:80]
+        # 把「被限流 / 人机校验」回灌给网络策略：后续作者抓取会自动放慢，
+        # 而不是继续用原节奏撞墙；普通失败只记一次，不触发加倍退避。
+        lowered = (message or "").lower()
+        blocked = any(key in lowered for key in
+                      ("频繁", "人机校验", "安全验证", "429", "403",
+                       "captcha", "verify", "challenge"))
+        net_policy.policy().record("page", ok=False, blocked=blocked)
         login_needed = any(key in (message or "") for key in
                            ("需要登录", "请先登录", "登录已失效"))
         if login_needed:
@@ -802,6 +892,7 @@ class ContactsSyncMixin:
             # 槽位由 worker 的 finished 释放并自动补位，这里不用再推进
             return
         pending = []
+        music_jobs = []          # 已下载但缺音乐、本次又拿到音乐地址的作品
         skipped = 0
         upgrade_checks = 0
         work_folders = {}
@@ -843,15 +934,23 @@ class ContactsSyncMixin:
             if self._work_files_exist(work, author_folder, author_name,
                                       folder_name):
                 skipped += 1
+                # 以前「已下载」就直接跳过，即使这次接口把音乐地址给出来了也
+                # 不会补。只做纯本地判定，不额外发请求，大作者也不会拖慢主线程。
+                if music_backfill_needed(work, author_folder, folder_name):
+                    music_jobs.append((work, author_folder, folder_name))
             elif self._work_in_cloud(author_folder, new_name, tar_name, folder_name):
                 # 目录还在（只剩文案.txt），媒体已经上传后删掉了
                 skipped += 1
             else:
                 pending.append(work)
+        # 无论本轮有没有新作品，都要把「现在能补音乐」的老作品排进后台队列。
+        music_note = (f"，补下背景音乐 {len(music_jobs)} 个"
+                      if music_jobs else "")
+        self._queue_music_backfill(music_jobs)
         if not pending:
             self.contact_status.setText(
                 f"已发现 {author.label()} 的 {total_works} 个作品，全部已下载"
-                f"（跳过 {skipped} 个）{profile_note}")
+                f"（跳过 {skipped} 个）{music_note}{profile_note}")
             # 槽位由 worker 的 finished 释放并自动补位，这里不用再推进
             return
         # 记下该作者这一轮还要下多少个，供「下载日志」算「还剩多少没下完」
@@ -870,7 +969,7 @@ class ContactsSyncMixin:
         self.contact_status.setText(
             f"已发现 {author.label()} 的 {total_works} 个作品："
             f"新增 {new_count} 个{upgrade_note}，跳过已下载 {skipped} 个"
-            f"（已加入并发下载队列）{profile_note}")
+            f"{music_note}（已加入并发下载队列）{profile_note}")
         self.dm.enqueue(jobs, start_index=start_index)
         # 不等待这批下载完成：worker 结束后槽位自动释放，由 _sync_dispatch
         # 补入下一位作者，继续并发抓取。

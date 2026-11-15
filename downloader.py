@@ -18,15 +18,10 @@ import urllib.parse
 from typing import Callable, Optional
 
 import requests
-from requests.adapters import HTTPAdapter
-
-try:
-    from urllib3.util.retry import Retry
-except ImportError:  # pragma: no cover - requests 总会带 urllib3
-    Retry = None
 
 import archive
 import config
+import net_policy
 
 ProgressCallback = Callable[[int, int, int], None]  # (item百分数, index, total)
 
@@ -35,7 +30,8 @@ class DownloadCancelled(Exception):
     """用户取消下载。"""
 
 
-_thread_local = threading.local()
+# 会话与重试/UA/代理策略统一放在 net_policy；这里保留 _get_session 这个名字，
+# 因为离线测试会 patch 它注入假 Session（见 tests/test_opt_20261113.py）。
 
 # 「原画质」回捞回调，由主窗口在开关打开时注入（downloader 不反向依赖
 # original_stream / Playwright）。签名：
@@ -81,29 +77,13 @@ def _video_stream_url(info, force=False):
 
 
 def _get_session() -> requests.Session:
-    """每个线程复用一个连接池：同一作品的多张图片/视频不再重复 TLS 握手。"""
-    session = getattr(_thread_local, "session", None)
-    if session is None:
-        session = requests.Session()
-        if Retry is not None:
-            retry = Retry(
-                total=2, connect=2, read=2, status=2,
-                backoff_factor=0.6,
-                status_forcelist=(429, 500, 502, 503, 504),
-                allowed_methods=frozenset(["GET", "HEAD"]),
-                raise_on_status=False,
-            )
-            adapter = HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=16)
-        else:  # pragma: no cover
-            adapter = HTTPAdapter(pool_connections=8, pool_maxsize=16)
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
-        session.headers.update({
-            "User-Agent": config.DESKTOP_UA,
-            "Referer": "https://www.douyin.com/",
-        })
-        _thread_local.session = session
-    return session
+    """每个线程复用一个连接池：同一作品的多张图片/视频不再重复 TLS 握手。
+
+    构造细节（Retry / UA / 代理）已收敛到 net_policy.build_session，这里只负责
+    按「cdn」通道取线程本地会话。行为与旧版一致，额外获得 408/425 重试、
+    Retry-After 支持与可选代理。
+    """
+    return net_policy.session_for("cdn")
 
 
 class DownloadResult:
@@ -314,18 +294,32 @@ def _download_to_file(url: str, target_path: str, progress: Optional[ProgressCal
                       index: int, total: int, timeout: int = 60,
                       timestamp: int = 0,
                       cancel_event: Optional[threading.Event] = None,
-                      byte_callback=None, chunk_size: int = 256 * 1024) -> int:
+                      byte_callback=None, chunk_size: int = 256 * 1024,
+                      resume: bool = True) -> int:
     """下载到 target_path（.part → rename），并设置文件时间为发布时间。
 
     支持断点续传：上次中断留下的 `.part` 会用 Range 继续；服务器不支持 Range 时自动重下。
+    `resume=False` 用于「换了直链后的重试」：旧 `.part` 属于上一条 URL（可能是过期
+    的原片 CDN 或更高/更低档位），带 Range 续传会把两个不同文件拼成一个坏 mp4，
+    必须从头覆盖写。
     """
     if not _is_allowed_host(url):
         raise ValueError("不允许的下载域名: " + url)
+    # 按 cdn 通道取令牌：被限流时 AutoThrottle 自动加延迟；等待过程随时响应取消。
+    # 放在每个媒体文件的请求前（而不是整个作品前），并发下载才能被真正限住。
+    if not net_policy.policy().wait("cdn", cancel_event):
+        raise DownloadCancelled("下载已取消")
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
     part = target_path + ".part"
     headers = {"Accept-Encoding": "identity"}
     part_size = 0
-    if os.path.exists(part):
+    if not resume:
+        # 删除失败也没关系：下面会以 "wb" 截断重写，不带 Range。
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+    elif os.path.exists(part):
         try:
             part_size = os.path.getsize(part)
         except OSError:
@@ -421,6 +415,50 @@ def _write_caption(info, directory: str, timestamp: int) -> str:
     )
 
 
+def has_music_file(directory: str) -> bool:
+    """作品目录里是否已经有背景音乐文件（`音乐.mp3` / `.m4a` / …）。"""
+    try:
+        with os.scandir(directory) as entries:
+            return any(
+                entry.is_file() and entry.name.startswith("音乐.")
+                and not entry.name.endswith(".part")
+                for entry in entries)
+    except OSError:
+        return False
+
+
+def download_music_only(info, author_folder: str, work_folder: str,
+                        cancel_event: Optional[threading.Event] = None) -> str:
+    """给「已下载但没有音乐」的作品补下背景音乐，返回文件路径；无需补时返回 ""。
+
+    只处理 2026-11-09 起的散文件目录 `<SAVE_ROOT>/<作者>/<作品id>/`：tar 包、
+    旧结构目录、媒体已被「上传后清理」删掉的作品一律不动，避免破坏归档或违背
+    用户的清理意图。`_download_to_file` 抛异常时不落盘，下一轮同步会自然重试。
+    """
+    aweme_id = str(getattr(info, "aweme_id", "") or "")
+    url = str(getattr(info, "music_url", "") or "")
+    if not url:
+        logging.info("作品 %s 未下载背景音乐：本次数据里没有音乐播放地址", aweme_id)
+        return ""
+    directory = work_dir(author_folder, work_folder, info)
+    if not os.path.isdir(directory):
+        logging.info("作品 %s 音乐补齐跳过：作品目录不存在（tar 包 / 旧结构 / 已清理）",
+                     aweme_id)
+        return ""
+    if has_music_file(directory):
+        return ""
+    ext = _guess_ext(url, "audio")
+    target = os.path.join(directory, "音乐" + ext)
+    # index/total 传 0/1：补齐是单文件操作，不参与整条作品进度轴。
+    _download_to_file(
+        url, target, None, 0, 1,
+        timestamp=int(getattr(info, "create_time", 0) or 0),
+        cancel_event=cancel_event)
+    logging.info("背景音乐补齐完成 aweme=%s size=%d path=%s",
+                 aweme_id, os.path.getsize(target), target)
+    return target
+
+
 def download_work(info, author_folder: str, work_folder: str,
                   progress: Optional[ProgressCallback] = None,
                   cancel_event: Optional[threading.Event] = None,
@@ -505,13 +543,16 @@ def download_work(info, author_folder: str, work_folder: str,
                 result.size = _download_to_file(
                     video_url, target, progress, 0, total,
                     timestamp=timestamp, cancel_event=cancel_event,
-                    byte_callback=byte_callback, chunk_size=chunk)
+                    byte_callback=byte_callback, chunk_size=chunk,
+                    resume=(attempt == 0))
                 break
             except DownloadCancelled:
                 raise
             except Exception:
                 if attempt == 0 and is_original:
                     # CDN 直链有时效：清缓存重新回捞一次；仍失败就回退最高转码档。
+                    # 重新回捞会换 URL（甚至从原片降到转码档），第一次留下的
+                    # .part 属于旧 URL，重试必须从头写，不能按 Range 接着拼。
                     logging.warning("原画质直链下载失败，重新回捞一次：%s",
                                     info.aweme_id, exc_info=True)
                     video_url, is_original = _video_stream_url(info, force=True)
@@ -534,6 +575,13 @@ def download_work(info, author_folder: str, work_folder: str,
             byte_callback=byte_callback)
         result.music_path = target
         result.music_saved = True
+    else:
+        # 以前这里完全静默：用户只能靠翻文件夹才发现少了音乐，也分不清是
+        # 「作品本来就没配乐」还是「解析失效」。明确记一条带原因的日志。
+        why = ("music 节点缺少播放地址（play_url / play_uri / uri 均为空）"
+               if getattr(info, "music_title", "")
+               else "详情数据里没有 music 节点（作品可能用原声 / 无配乐）")
+        logging.info("作品 %s 未下载背景音乐：%s", info.aweme_id, why)
 
     # 完整文案单独存 txt（文件夹名只保留前 15 字），和作品放在同一个文件夹里
     result.caption_path = _write_caption(info, video_dir, timestamp)

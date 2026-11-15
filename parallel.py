@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from PySide6.QtCore import QObject, Signal
 
 import downloader
+import net_policy
 
 
 class DownloadManager(QObject):
@@ -127,7 +128,6 @@ class DownloadManager(QObject):
         if stop_event.is_set():
             self._finish_one(False, index, None, "已取消", generation)
             return
-        last_error = None
         self.item_started.emit(index)
         # 「云端已有但可能是低画质」的作品：下载前先核对远端分辨率。
         # 达标就整单跳过，省掉一次几十 MB 的下载；低于解析结果才继续。
@@ -142,28 +142,43 @@ class DownloadManager(QObject):
                 self._finish_one(False, index, None, reason, generation,
                                  skipped=True)
                 return
-        for attempt in range(2):
-            if stop_event.is_set():
-                self._finish_one(False, index, None, "已取消", generation)
-                return
-            try:
-                result = downloader.download_work(
-                    info, author_folder, work_folder,
-                    cancel_event=stop_event,
-                    byte_callback=self._byte_callback,
-                    pack_tar=self.pack_tar,
-                    progress=lambda pct, idx, total: self._emit_progress(
-                        index, pct, idx, total, generation))
-                self._finish_one(True, index, result, "", generation)
-                return
-            except downloader.DownloadCancelled:
-                self._finish_one(False, index, None, "已取消", generation)
-                return
-            except Exception as e:  # noqa: BLE001
-                last_error = e
-                if attempt == 0:
-                    time.sleep(1.0)
-        self._finish_one(False, index, None, str(last_error) or "下载失败", generation)
+        # 任务级重试交给 net_policy：指数退避 + 抖动 + 可中断等待 + 结构化诊断，
+        # 取代原来的「固定 sleep(1.0) 再来一次」。限流不在这里做，
+        # downloader._download_to_file 已按「每个媒体请求」取令牌。
+        aweme_id = getattr(info, "aweme_id", "")
+
+        def do_download():
+            return downloader.download_work(
+                info, author_folder, work_folder,
+                cancel_event=stop_event,
+                byte_callback=self._byte_callback,
+                pack_tar=self.pack_tar,
+                progress=lambda pct, idx, total: self._emit_progress(
+                    index, pct, idx, total, generation))
+
+        def should_retry(exc):
+            return (not isinstance(exc, downloader.DownloadCancelled)
+                    and net_policy.policy().retry.should_retry(exc))
+
+        outcome = net_policy.retry_sync(
+            do_download, key="cdn", tag=f"aweme={aweme_id}",
+            should_retry=should_retry, cancel_event=stop_event,
+            throttle=False,
+            on_retry=lambda attempt, exc, delay: logging.info(
+                "下载重试 aweme=%s 第%d次 等待%.2fs: %s",
+                aweme_id, attempt, delay, exc))
+        if outcome.ok:
+            self._finish_one(True, index, outcome.value, "", generation)
+            return
+        err = outcome.error
+        if (isinstance(err, downloader.DownloadCancelled)
+                or outcome.reason == "cancelled" or stop_event.is_set()):
+            self._finish_one(False, index, None, "已取消", generation)
+            return
+        message = str(err) if err else (outcome.reason or "下载失败")
+        logging.warning("下载失败 aweme=%s attempts=%d reason=%s: %s",
+                        aweme_id, outcome.attempts, outcome.reason, message)
+        self._finish_one(False, index, None, message or "下载失败", generation)
 
     def _finish_one(self, ok, index, result, error, generation=None,
                     skipped=False):

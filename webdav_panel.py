@@ -37,6 +37,9 @@ MEDIA_EXTS = {
 # 上传记录里的相对路径都以这几个顶层目录开头（对应 UPLOAD_DIRS）。
 UPLOAD_BASES = ("净影", "Videos", "Music")
 
+# 只保护 _auto_state_save_lock 的懒初始化；与业务状态锁分开，避免重入死锁。
+_AUTO_STATE_INIT_LOCK = threading.Lock()
+
 
 def _close_client(dav):
     """关掉 WebDAVClient 的连接池；测试里的假 client 没有 close 也不能抛。"""
@@ -888,8 +891,15 @@ class WebdavMixin:
             return
         lock = getattr(self, "_auto_state_save_lock", None)
         if lock is None:
-            lock = self._auto_state_save_lock = threading.Lock()
-            self._auto_state_last_save = 0.0
+            # 多个下载线程可能在同一瞬间第一次走到这里：以前各自 new 一把锁，
+            # 都会认为自己拿到了节流锁，于是同一秒把 10MB 上传记录写好几遍。
+            # 用模块级专用锁做双重检查（不复用业务锁，避免重入死锁）。
+            # 先写时间戳再暴露锁，别的线程一看到锁就一定也能看到时间戳。
+            with _AUTO_STATE_INIT_LOCK:
+                lock = getattr(self, "_auto_state_save_lock", None)
+                if lock is None:
+                    self._auto_state_last_save = 0.0
+                    lock = self._auto_state_save_lock = threading.Lock()
         # 平时拿不到锁就让别的线程继续传文件；收尾时阻塞等，确保不丢记录。
         if not lock.acquire(force):
             return
